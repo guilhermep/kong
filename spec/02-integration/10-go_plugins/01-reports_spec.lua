@@ -10,7 +10,7 @@ for _, strategy in helpers.each_strategy() do
 
   describe("anonymous reports for go plugins #" .. strategy, function()
     local reports_send_ping = function(port)
-      ngx.sleep(0.2) -- hand over the CPU so other threads can do work (processing the sent data)
+      ngx.sleep(0.01) -- hand over the CPU so other threads can do work (processing the sent data)
       local admin_client = helpers.admin_client()
       local res = admin_client:post("/reports/send-ping" .. (port and "?port=" .. port or ""))
       assert.response(res).has_status(200)
@@ -94,11 +94,14 @@ for _, strategy in helpers.each_strategy() do
     end)
 
     it("logs number of requests triggering a go plugin", function()
+      local wait_timers_ctx = helpers.wait_timers_begin()
       local proxy_client = assert(helpers.proxy_client())
       local res = proxy_client:get("/", {
         headers = { host  = "http-service.test" }
       })
       assert.res_status(200, res)
+
+      helpers.wait_timers_end(wait_timers_ctx)
 
       reports_send_ping(constants.REPORTS.STATS_TLS_PORT)
 
@@ -111,10 +114,14 @@ for _, strategy in helpers.each_strategy() do
     end)
 
     it("runs fake 'response' phase", function()
+      local wait_timers_ctx = helpers.wait_timers_begin()
+
       local proxy_client = assert(helpers.proxy_client())
       local res = proxy_client:get("/", {
         headers = { host  = "http-service.test" }
       })
+
+      helpers.wait_timers_end(wait_timers_ctx)
 
       -- send a ping so the tcp server shutdown cleanly and not with a timeout.
       reports_send_ping(constants.REPORTS.STATS_TLS_PORT)
@@ -126,6 +133,8 @@ for _, strategy in helpers.each_strategy() do
 
     describe("log phase has access to stuff", function()
       it("puts that stuff in the log", function()
+        local wait_timers_ctx = helpers.wait_timers_begin()
+
         local proxy_client = assert(helpers.proxy_client())
         local res = proxy_client:get("/", {
           headers = {
@@ -133,6 +142,8 @@ for _, strategy in helpers.each_strategy() do
             ["X-Loose-Data"] = "this",
           }
         })
+
+        helpers.wait_timers_end(wait_timers_ctx)
 
         -- send a ping so the tcp server shutdown cleanly and not with a timeout.
         reports_send_ping(constants.REPORTS.STATS_TLS_PORT)
