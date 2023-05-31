@@ -1,4 +1,5 @@
 local pdk_tracer = require "kong.pdk.tracing".new()
+local propagation = require "kong.tracing.propagation"
 local utils = require "kong.tools.utils"
 local tablepool = require "tablepool"
 local tablex = require "pl.tablex"
@@ -8,9 +9,14 @@ local ngx_re = require "ngx.re"
 
 local ngx = ngx
 local var = ngx.var
+local type = type
+local next = next
 local pack = utils.pack
 local unpack = utils.unpack
 local insert = table.insert
+local assert = assert
+local pairs = pairs
+local ipairs = ipairs
 local new_tab = base.new_tab
 local time_ns = utils.time_ns
 local tablepool_release = tablepool.release
@@ -18,6 +24,8 @@ local get_method = ngx.req.get_method
 local ngx_log = ngx.log
 local ngx_DEBUG = ngx.DEBUG
 local concat = table.concat
+local tonumber = tonumber
+local setmetatable = setmetatable
 local cjson_encode = cjson.encode
 local _log_prefix = "[tracing] "
 local split = ngx_re.split
@@ -34,7 +42,7 @@ function _M.db_query(connector)
   local f = connector.query
 
   local function wrap(self, sql, ...)
-    local span = tracer.start_span("query")
+    local span = tracer.start_span("kong.database.query")
     span:set_attribute("db.system", kong.db and kong.db.strategy)
     span:set_attribute("db.statement", sql)
     -- raw query
@@ -51,7 +59,13 @@ end
 
 -- Record Router span
 function _M.router()
-  return tracer.start_span("router")
+  return tracer.start_span("kong.router")
+end
+
+
+-- Create a span without adding it to the KONG_SPANS list
+function _M.create_span(...)
+  return tracer.create_span(...)
 end
 
 
@@ -68,35 +82,57 @@ function _M.balancer(ctx)
   local balancer_tries = balancer_data.tries
   local try_count = balancer_data.try_count
   local upstream_connect_time = split(var.upstream_connect_time, ", ", "jo")
+
+  local last_try_balancer_span
+  do
+    local propagated = propagation.get_propagated()
+    -- pre-created balancer span was not linked yet
+    if propagated and not propagated.linked then
+      last_try_balancer_span = propagated
+    end
+  end
+
   for i = 1, try_count do
     local try = balancer_tries[i]
-    span = tracer.start_span("balancer try #" .. i, {
-      kind = 3, -- client
-      start_time_ns = try.balancer_start * 1e6,
+    local span_name = "kong.balancer"
+    local span_options = {
+      span_kind = 3, -- client
+      start_time_ns = try.balancer_start_ns,
       attributes = {
+        ["try_count"] =  i,
         ["net.peer.ip"] = try.ip,
         ["net.peer.port"] = try.port,
       }
-    })
+    }
 
-    if try.state then
-      span:set_attribute("http.status_code", try.code)
-      span:set_status(2)
-    end
+    -- one of the unsuccessful tries
+    if i < try_count or try.state ~= nil or not last_try_balancer_span then
+      span = tracer.start_span(span_name, span_options)
 
-    -- last try
-    if i == try_count and try.state == nil then
-      local upstream_finish_time = ctx.KONG_BODY_FILTER_ENDED_AT and ctx.KONG_BODY_FILTER_ENDED_AT * 1e6
-      span:finish(upstream_finish_time)
+      if try.state then
+        span:set_attribute("http.status_code", try.code)
+        span:set_status(2)
+      end
 
-    else
-      -- retrying
-      if try.balancer_latency ~= nil then
-        local try_upstream_connect_time = (tonumber(upstream_connect_time[i]) or 0) * 1000
-        span:finish((try.balancer_start + try.balancer_latency + try_upstream_connect_time) * 1e6)
+      if try.balancer_latency_ns ~= nil then
+        local try_upstream_connect_time = (tonumber(upstream_connect_time[i], 10) or 0) * 1000
+        span:finish(try.balancer_start_ns + try.balancer_latency_ns + try_upstream_connect_time * 1e6)
       else
         span:finish()
       end
+
+    else
+      -- last try: load the last span (already created/propagated)
+      span = last_try_balancer_span
+      tracer:link_span(span, span_name, span_options)
+
+      if try.state then
+        span:set_attribute("http.status_code", try.code)
+        span:set_status(2)
+      end
+
+      local upstream_finish_time = ctx.KONG_BODY_FILTER_ENDED_AT_NS
+      span:finish(upstream_finish_time)
     end
   end
 end
@@ -109,7 +145,7 @@ local function plugin_callback(phase)
     local plugin_name = plugin.name
     local name = name_memo[plugin_name]
     if not name then
-      name = phase .. " phase: " .. plugin_name
+      name = "kong." .. phase .. ".plugin." .. plugin_name
       name_memo[plugin_name] = name
     end
 
@@ -132,6 +168,7 @@ function _M.http_client()
   local function wrap(self, uri, params)
     local method = params and params.method or "GET"
     local attributes = new_tab(0, 5)
+    -- passing full URI to http.url attribute
     attributes["http.url"] = uri
     attributes["http.method"] = method
     attributes["http.flavor"] = params and params.version or "1.1"
@@ -143,8 +180,8 @@ function _M.http_client()
       attributes["http.proxy"] = http_proxy
     end
 
-    local span = tracer.start_span("HTTP " .. method .. " " .. uri, {
-      span_kind = 3,
+    local span = tracer.start_span("kong.internal.request", {
+      span_kind = 3, -- client
       attributes = attributes,
     })
 
@@ -162,7 +199,7 @@ function _M.http_client()
   http.request_uri = wrap
 end
 
---- Regsiter vailable_types
+--- Register available_types
 -- functions in this list will be replaced with NOOP
 -- if tracing module is NOT enabled.
 for k, _ in pairs(_M) do
@@ -173,27 +210,33 @@ _M.available_types = available_types
 
 -- Record inbound request
 function _M.request(ctx)
-  local req = kong.request
   local client = kong.client
 
   local method = get_method()
-  local path = req.get_path()
-  local span_name = method .. " " .. path
-  local req_uri = ctx.request_uri or var.request_uri
+  local scheme = ctx.scheme or var.scheme
+  local host = var.host
+  -- passing full URI to http.url attribute
+  local req_uri = scheme .. "://" .. host .. (ctx.request_uri or var.request_uri)
 
-  local start_time = ngx.ctx.KONG_PROCESSING_START
-      and ngx.ctx.KONG_PROCESSING_START * 1e6
-      or time_ns()
+  local start_time = ctx.KONG_PROCESSING_START
+                 and ctx.KONG_PROCESSING_START * 1e6
+                  or time_ns()
 
-  local active_span = tracer.start_span(span_name, {
+  local http_flavor = ngx.req.http_version()
+  if type(http_flavor) == "number" then
+    http_flavor = string.format("%.1f", http_flavor)
+  end
+
+  local active_span = tracer.start_span("kong", {
     span_kind = 2, -- server
     start_time_ns = start_time,
     attributes = {
       ["http.method"] = method,
       ["http.url"] = req_uri,
-      ["http.host"] = var.host,
-      ["http.scheme"] = ctx.scheme or var.scheme,
-      ["http.flavor"] = ngx.req.http_version(),
+      ["http.host"] = host,
+      ["http.scheme"] = scheme,
+      ["http.flavor"] = http_flavor,
+      ["http.client_ip"] = client.get_forwarded_ip(),
       ["net.peer.ip"] = client.get_ip(),
     },
   })
@@ -206,16 +249,11 @@ local patch_dns_query
 do
   local raw_func
   local patch_callback
-  local name_memo = {}
 
   local function wrap(host, port)
-    local name = name_memo[host]
-    if not name then
-      name = "DNS: " .. host
-      name_memo[host] = name
-    end
-
-    local span = tracer.start_span(name)
+    local span = tracer.start_span("kong.dns", {
+      span_kind = 3, -- client
+    })
     local ip_addr, res_port, try_list = raw_func(host, port)
     if span then
       span:set_attribute("dns.record.domain", host)
@@ -250,7 +288,16 @@ do
   available_types.dns_query = true
 end
 
+
 -- runloop
+function _M.runloop_before_header_filter()
+  local root_span = ngx.ctx.KONG_SPANS and ngx.ctx.KONG_SPANS[1]
+  if root_span then
+    root_span:set_attribute("http.status_code", ngx.status)
+  end
+end
+
+
 function _M.runloop_log_before(ctx)
   -- add balancer
   _M.balancer(ctx)
@@ -310,8 +357,8 @@ function _M.runloop_log_after(ctx)
 end
 
 function _M.init(config)
-  local trace_types = config.opentelemetry_tracing
-  local sampling_rate = config.opentelemetry_tracing_sampling_rate
+  local trace_types = config.tracing_instrumentations
+  local sampling_rate = config.tracing_sampling_rate
   assert(type(trace_types) == "table" and next(trace_types))
   assert(sampling_rate >= 0 and sampling_rate <= 1)
 

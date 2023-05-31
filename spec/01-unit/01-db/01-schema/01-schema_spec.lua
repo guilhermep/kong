@@ -1,20 +1,6 @@
 local Schema = require "kong.db.schema"
 local cjson  = require "cjson"
-
-
-local luacov_ok = pcall(require, "luacov")
-if luacov_ok then
-  local busted_it = it
-  -- luacheck: globals it
-  it = function(desc, fn)
-    busted_it(desc, function()
-      local luacov = require("luacov")
-      luacov.init()
-      fn()
-      luacov.save_stats()
-    end)
-  end
-end
+local helpers = require "spec.helpers"
 
 
 local SchemaKind = {
@@ -114,14 +100,14 @@ describe("schema", function()
     it("validates a range with 'between'", function()
       local Test = Schema.new({
         fields = {
-          { a_number = { type = "number", between = { 10, 20 } } }
+          { a_number = { type = "number", between = { 9.5, 20.5 } } }
         }
       })
       assert.truthy(Test:validate({ a_number = 15 }))
       assert.truthy(Test:validate({ a_number = 10 }))
       assert.truthy(Test:validate({ a_number = 20 }))
-      assert.falsy(Test:validate({ a_number = 9 }))
-      assert.falsy(Test:validate({ a_number = 21 }))
+      assert.falsy(Test:validate({ a_number = 9.4 }))
+      assert.falsy(Test:validate({ a_number = 20.9 }))
       assert.falsy(Test:validate({ a_number = "wat" }))
     end)
 
@@ -870,6 +856,30 @@ describe("schema", function()
       assert.falsy(Test:validate({ f = { r = { a = 2 }}}))
       assert.falsy(Test:validate({ f = { r = { b = "foo" }}}))
       assert.falsy(Test:validate({ f = { r = { a = 2, b = "foo" }}}))
+    end)
+
+    it("validates shorthands type check with nested records", function()
+      local Test = Schema.new({
+        fields = {
+          { r = {
+              type = "record",
+              fields = {
+                { a = { type = "string" } },
+                { b = { type = "number" } } },
+              shorthand_fields = {
+                {
+                  username = {
+                    type = "string",
+                    func = function(value)
+                      return {
+                        b = value
+                      }
+                    end,
+                  }}}}}}})
+      local input =  { r = { username = 123 }}
+      local ok, err = Test:process_auto_fields(input)
+      assert.falsy(ok)
+      assert.same({ username = "expected a string" }, err)
     end)
 
     it("validates an integer", function()
@@ -2675,6 +2685,82 @@ describe("schema", function()
       assert.falsy(err)
     end)
 
+    it("run an entity check with flag 'run_with_missing_fields'", function()
+      local Test = Schema.new({
+        fields = {
+          { aaa = { type = "string", len_min = 4 } },
+          { bbb = { type = "string", len_min = 8 } },
+          { ccc = { type = "number", between = { 0, 10 } } },
+        },
+        entity_checks = {
+          { custom_entity_check = {
+            run_with_missing_fields = true,
+            field_sources = { "aaa", "bbb", "ccc" },
+            fn = function(entity)
+              if entity.aaa and entity.aaa ~= "abcd" then
+                return nil, "oh no"
+              end
+
+              if entity.bbb == "12345678" and entity.ccc == 2 then
+                return true
+              end
+              return nil, "oh no"
+            end,
+          } }
+        }
+      })
+
+      -- missing field 'aaa'
+      local ok, err = Test:validate_update({
+        bbb = "foo",
+        ccc = 42
+      })
+      assert.falsy(ok)
+      assert.is_nil(err["aaa"])
+      assert.match("length must be at least 8", err["bbb"])
+      assert.match("value should be between 0 and 10", err["ccc"])
+      assert.falsy(err["@entity"])
+
+      -- has field 'aaa'
+      local ok, err = Test:validate_update({
+        aaa = "xxx",
+        bbb = "foo",
+        ccc = 42
+      })
+      assert.falsy(ok)
+      assert.match("length must be at least 4", err["aaa"])
+      assert.match("length must be at least 8", err["bbb"])
+      assert.match("value should be between 0 and 10", err["ccc"])
+      assert.falsy(err["@entity"])
+
+      -- field 'aaa' has wrong value
+      local ok, err = Test:validate_update({
+        aaa = "xxxxxxxx",
+        bbb = "12345678",
+        ccc = 2
+      })
+      assert.falsy(ok)
+      assert.truthy(err["@entity"])
+      assert.match("oh no", err["@entity"][1])
+
+      -- missing field 'aaa', others are right
+      local ok, err = Test:validate_update({
+        bbb = "12345678",
+        ccc = 2
+      })
+      assert.truthy(ok)
+      assert.falsy(err)
+
+      -- all fields are right
+      local ok, err = Test:validate_update({
+        aaa = "abcd",
+        bbb = "12345678",
+        ccc = 2
+      })
+      assert.truthy(ok)
+      assert.falsy(err)
+    end)
+
     it("supports entity checks on nested fields", function()
       local Test = Schema.new({
         fields = {
@@ -2818,13 +2904,11 @@ describe("schema", function()
             arr = { type = "array", elements = { type = "string" } }, }, {
             set = { type = "set", elements = { type = "string" } }, }, {
             map = { type = "map", keys = { type = "string" }, values = { type = "string" } }, }, {
-            est = { type = "string", len_min = 0 }, }, {
-            lst = { type = "string", legacy = true }, }, } } },
+            est = { type = "string", len_min = 0 }, }, }, }, },
           { arr = { type = "array", elements = { type = "string" } }, },
           { set = { type = "set", elements = { type = "string" } }, },
           { map = { type = "map", keys = { type = "string" }, values = { type = "string" } }, },
           { est = { type = "string", len_min = 0 }, },
-          { lst = { type = "string", legacy = true }, },
         }
       })
       local data, err = Test:process_auto_fields({
@@ -2835,13 +2919,11 @@ describe("schema", function()
           set = { "", "a", "" },
           map = { key = "" },
           est = "",
-          lst = "",
         },
         arr = { "", "a", "" },
         set = { "", "a", "" },
         map = { key = "" },
         est = "",
-        lst = "",
       }, "select")
 
       assert.is_nil(err)
@@ -2850,7 +2932,6 @@ describe("schema", function()
       assert.same({"", "a" }, data.set)        -- set,   TODO: should we remove empty strings from sets?
       assert.same({ key = "" }, data.map)      -- map,   TODO: should we remove empty strings from maps?
       assert.equal("", data.est)
-      assert.equal("", data.lst)
 
       -- record
       assert.equal(nil, data.rec.str)          -- string
@@ -2858,7 +2939,6 @@ describe("schema", function()
       assert.same({"", "a" }, data.rec.set)    -- set,   TODO: should we remove empty strings from sets?
       assert.same({ key = "" }, data.rec.map)  -- map,   TODO: should we remove empty strings from maps?
       assert.equal("", data.rec.est)
-      assert.equal("", data.rec.lst)
     end)
 
     it("produces ngx.null (when asked) for empty string fields with selects", function()
@@ -2870,13 +2950,11 @@ describe("schema", function()
             arr = { type = "array", elements = { type = "string" } }, }, {
             set = { type = "set", elements = { type = "string" } }, }, {
             map = { type = "map", keys = { type = "string" }, values = { type = "string" } }, }, {
-            est = { type = "string", len_min = 0 }, }, {
-            lst = { type = "string", legacy = true }, }, } } },
+            est = { type = "string", len_min = 0 }, }, }, }, },
           { arr = { type = "array", elements = { type = "string" } }, },
           { set = { type = "set", elements = { type = "string" } }, },
           { map = { type = "map", keys = { type = "string" }, values = { type = "string" } }, },
           { est = { type = "string", len_min = 0 }, },
-          { lst = { type = "string", legacy = true }, },
         }
       })
       local data, err = Test:process_auto_fields({
@@ -2887,13 +2965,11 @@ describe("schema", function()
           set = { "", "a", "" },
           map = { key = "" },
           est = "",
-          lst = "",
         },
         arr = { "", "a", "" },
         set = { "", "a", "" },
         map = { key = "" },
         est = "",
-        lst = "",
       }, "select", true)
       assert.is_nil(err)
       assert.equal(cjson.null, data.str)       -- string
@@ -2901,7 +2977,6 @@ describe("schema", function()
       assert.same({"", "a" }, data.set)        -- set,   TODO: should we set null empty strings from sets?
       assert.same({ key = "" }, data.map)      -- map,   TODO: should we set null empty strings from maps?
       assert.equal("", data.est)
-      assert.equal("", data.lst)
 
       -- record
       assert.equal(cjson.null, data.rec.str)   -- string
@@ -2909,7 +2984,6 @@ describe("schema", function()
       assert.same({"", "a" }, data.rec.set)    -- set,   TODO: should we set null empty strings from sets?
       assert.same({ key = "" }, data.rec.map)  -- map,   TODO: should we set null empty strings from maps?
       assert.equal("", data.rec.est)
-      assert.equal("", data.rec.lst)
     end)
 
     it("does not produce non-required fields on 'update'", function()
@@ -3541,6 +3615,98 @@ describe("schema", function()
         assert.same(input, output)
       end)
     end)
+
+    describe("#referenceable fields", function()
+      lazy_setup(function()
+        _G.kong = {
+          vault = require "kong.pdk.vault".new(),
+        }
+      end)
+      lazy_teardown(function()
+        _G.kong = nil
+        -- clear `_workspaceable` table cache
+        package.loaded["kong.db.schema"] = nil
+        Schema = require "kong.db.schema"
+      end)
+
+      it("dereference array type field", function()
+        helpers.setenv("TEST_SECRET_FOO", "foo")
+        helpers.setenv("TEST_SECRET_BAR", "bar")
+        finally(function()
+          helpers.unsetenv("TEST_SECRET_FOO")
+          helpers.unsetenv("TEST_SECRET_BAR")
+        end)
+
+        local Test = Schema.new({
+          fields = {
+            { secrets = {
+              type = "array",
+              elements = {
+                type = "string",
+                referenceable = true,
+              },
+            } },
+          },
+        })
+
+        local data = Test:process_auto_fields({
+          secrets = {
+            "{vault://env/test_secret_foo}",
+            "{vault://env/test_secret_bar}",
+          },
+        }, "select")
+
+        assert.same({
+          secrets = {
+            "{vault://env/test_secret_foo}",
+            "{vault://env/test_secret_bar}",
+          },
+        }, data["$refs"])
+
+        assert.same({"foo", "bar"}, data.secrets)
+      end)
+
+      it("dereference map type field", function()
+        helpers.setenv("TEST_SECRET_FOO", "foo")
+        helpers.setenv("TEST_SECRET_BAR", "bar")
+        finally(function()
+          helpers.unsetenv("TEST_SECRET_FOO")
+          helpers.unsetenv("TEST_SECRET_BAR")
+        end)
+
+        local Test = Schema.new({
+          fields = {
+            { secret = {
+              type = "map",
+              keys = "string",
+              values = {
+                type = "string",
+                referenceable = true,
+              },
+            } },
+          },
+        })
+
+        local data = Test:process_auto_fields({
+          secret = {
+            foo = "{vault://env/test_secret_foo}",
+            bar = "{vault://env/test_secret_bar}",
+          },
+        }, "select")
+
+        assert.same({
+          secret = {
+            foo = "{vault://env/test_secret_foo}",
+            bar = "{vault://env/test_secret_bar}",
+          },
+        }, data["$refs"])
+
+        assert.same({
+          foo = "foo",
+          bar = "bar",
+        }, data.secret)
+      end)
+    end)
   end)
 
   describe("merge_values", function()
@@ -3957,6 +4123,68 @@ describe("schema", function()
 
   for i = 1, 2 do
   describe("transform (" .. SchemaKind[i].name .. ")", function()
+    it("transforms entity", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            on_write = function(entity)
+              return { name = entity.name:upper() }
+            end,
+          },
+        },
+      }
+      local entity = { name = "test1" }
+
+      local TestEntities = SchemaKind[i].new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity)
+
+      assert.truthy(transformed_entity)
+      assert.equal("TEST1", transformed_entity.name)
+    end)
+
+    it("transforms entity on write and read", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            on_write = function(entity)
+              return { name = entity.name:upper() }
+            end,
+            on_read = function(entity)
+              return { name = entity.name:lower() }
+            end,
+          },
+        },
+      }
+      local entity = { name = "TeSt1" }
+
+      local TestEntities = SchemaKind[i].new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity)
+
+      assert.truthy(transformed_entity)
+      assert.equal("TEST1", transformed_entity.name)
+
+      transformed_entity, _ = TestEntities:transform(transformed_entity, nil, "select")
+
+      assert.truthy(transformed_entity)
+      assert.equal("test1", transformed_entity.name)
+    end)
+
     it("transforms fields", function()
       local test_schema = {
         name = "test",
@@ -4107,6 +4335,38 @@ describe("schema", function()
       assert.equal("test1", transformed_entity.name)
     end)
 
+    it("transforms entity with multiple transformations", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            on_write = function(entity)
+              return { name = "How are you " .. entity.name }
+            end,
+          },
+          {
+            on_write = function(entity)
+              return { name = entity.name .. "?" }
+            end,
+          },
+        },
+      }
+
+      local entity = { name = "Bob" }
+
+      local TestEntities = SchemaKind[i].new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity)
+
+      assert.truthy(transformed_entity)
+      assert.equal("How are you Bob?", transformed_entity.name)
+    end)
 
     it("transforms fields with multiple transformations", function()
       local test_schema = {
@@ -4176,6 +4436,33 @@ describe("schema", function()
       assert.equal(3, transformed_entity.age)
     end)
 
+    it("returns error if entity transformation returns an error", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            on_write = function(entity)
+              return nil, "unable to transform entity"
+            end,
+          },
+        },
+      }
+      local entity = { name = "test1" }
+
+      local TestEntities = SchemaKind[i].new(test_schema)
+      local transformed_entity, err = TestEntities:transform(entity)
+
+      assert.falsy(transformed_entity)
+      assert.equal("transformation failed: unable to transform entity", err)
+    end)
+
     it("returns error if transformation returns an error", function()
       local test_schema = {
         name = "test",
@@ -4203,6 +4490,7 @@ describe("schema", function()
       assert.falsy(transformed_entity)
       assert.equal("transformation failed: unable to transform name", err)
     end)
+
 
     it("skips transformation if needs are not fulfilled", function()
       local test_schema = {

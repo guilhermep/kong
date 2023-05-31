@@ -58,6 +58,7 @@ return {
         } },
         { host = typedefs.host },
         { port = typedefs.port { default = 443 }, },
+        { disable_https = { type = "boolean", default = false }, },
         { unhandled_status = {
           type = "integer",
           between = { 100, 999 },
@@ -94,6 +95,12 @@ return {
         { base64_encode_body = {
           type = "boolean",
           default = true,
+        } },
+        { aws_imds_protocol_version = {
+          type = "string",
+          required = true,
+          default = "v1",
+          one_of = { "v1", "v2" }
         } },
       }
     },

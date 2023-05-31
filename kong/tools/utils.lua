@@ -14,17 +14,17 @@ local pl_stringx = require "pl.stringx"
 local pl_stringio = require "pl.stringio"
 local pl_utils = require "pl.utils"
 local pl_path = require "pl.path"
+local pl_file = require "pl.file"
 local zlib = require "ffi-zlib"
 
 local C             = ffi.C
-local ffi_fill      = ffi.fill
 local ffi_new       = ffi.new
-local ffi_str       = ffi.string
 local type          = type
 local pairs         = pairs
 local ipairs        = ipairs
 local select        = select
 local tostring      = tostring
+local tonumber      = tonumber
 local sort          = table.sort
 local concat        = table.concat
 local insert        = table.insert
@@ -32,11 +32,10 @@ local lower         = string.lower
 local fmt           = string.format
 local find          = string.find
 local gsub          = string.gsub
+local join          = pl_stringx.join
 local split         = pl_stringx.split
 local re_find       = ngx.re.find
 local re_match      = ngx.re.match
-local get_phase     = ngx.get_phase
-local ngx_sleep     = ngx.sleep
 local inflate_gzip  = zlib.inflateGzip
 local deflate_gzip  = zlib.deflateGzip
 local stringio_open = pl_stringio.open
@@ -71,7 +70,6 @@ char *strerror(int errnum);
 ]]
 
 local _M = {}
-local YIELD_ITERATIONS = 500
 
 --- splits a string.
 -- just a placeholder to the penlight `pl.stringx.split` function
@@ -159,28 +157,30 @@ do
 
   local system_constants = require "lua_system_constants"
   local O_RDONLY = system_constants.O_RDONLY()
+  local ffi_fill    = ffi.fill
+  local ffi_str     = ffi.string
   local bytes_buf_t = ffi.typeof "char[?]"
 
   local function urandom_bytes(buf, size)
-    local fd = ffi.C.open("/dev/urandom", O_RDONLY, 0) -- mode is ignored
+    local fd = C.open("/dev/urandom", O_RDONLY, 0) -- mode is ignored
     if fd < 0 then
       ngx_log(WARN, "Error opening random fd: ",
-                    ffi_str(ffi.C.strerror(ffi.errno())))
+                    ffi_str(C.strerror(ffi.errno())))
 
       return false
     end
 
-    local res = ffi.C.read(fd, buf, size)
+    local res = C.read(fd, buf, size)
     if res <= 0 then
       ngx_log(WARN, "Error reading from urandom: ",
-                    ffi_str(ffi.C.strerror(ffi.errno())))
+                    ffi_str(C.strerror(ffi.errno())))
 
       return false
     end
 
-    if ffi.C.close(fd) ~= 0 then
+    if C.close(fd) ~= 0 then
       ngx_log(WARN, "Error closing urandom: ",
-                    ffi_str(ffi.C.strerror(ffi.errno())))
+                    ffi_str(C.strerror(ffi.errno())))
     end
 
     return true
@@ -331,6 +331,8 @@ do
   end
 
 
+  local ngx_null = ngx.null
+
   --- Encode a Lua table to a querystring
   -- Tries to mimic ngx_lua's `ngx.encode_args`, but has differences:
   -- * It percent-encodes querystring values.
@@ -363,7 +365,7 @@ do
       local value = args[key]
       if type(value) == "table" then
         recursive_encode_args(key, value, raw, no_array_indexes, query)
-      elseif value == ngx.null then
+      elseif value == ngx_null then
         query[#query+1] = encode_args_value(key, "")
       elseif  value ~= nil or raw then
         value = tostring(value)
@@ -390,7 +392,7 @@ do
       keys[len] = number
     end
 
-    table.sort(keys)
+    sort(keys)
     local new_t = {}
 
     for i=1,len do
@@ -418,7 +420,7 @@ do
       if type(v) == "table" then
         v = decode_array(v) or v
       elseif v == "" then
-        v = ngx.null
+        v = ngx_null
       elseif v == "true" then
         v = true
       elseif v == "false" then
@@ -474,16 +476,17 @@ end
 -- @param t2 The second table
 -- @return The (new) merged table
 function _M.table_merge(t1, t2)
-  if not t1 then
-    t1 = {}
-  end
-  if not t2 then
-    t2 = {}
-  end
-
   local res = {}
-  for k,v in pairs(t1) do res[k] = v end
-  for k,v in pairs(t2) do res[k] = v end
+  if t1 then
+    for k,v in pairs(t1) do
+      res[k] = v
+    end
+  end
+  if t2 then
+    for k,v in pairs(t2) do
+      res[k] = v
+    end
+  end
   return res
 end
 
@@ -685,7 +688,7 @@ end
 -- Will not throw an error if the module was not found, but will throw an error if the
 -- loading failed for another reason (eg: syntax error).
 -- @param module_name Path of the module to load (ex: kong.plugins.keyauth.api).
--- @return success A boolean indicating wether the module was found.
+-- @return success A boolean indicating whether the module was found.
 -- @return module The retrieved module, or the error in case of a failure
 function _M.load_module_if_exists(module_name)
   local status, res = xpcall(function()
@@ -1043,6 +1046,62 @@ _M.validate_cookie_name = function(name)
 end
 
 
+local validate_labels
+do
+  local nkeys = require "table.nkeys"
+
+  local MAX_KEY_SIZE   = 63
+  local MAX_VALUE_SIZE = 63
+  local MAX_KEYS_COUNT = 10
+
+  -- validation rules based on Kong Labels AIP
+  -- https://kong-aip.netlify.app/aip/129/
+  local BASE_PTRN = "[a-z0-9]([\\w\\.:-]*[a-z0-9]|)$"
+  local KEY_PTRN  = "(?!kong)(?!konnect)(?!insomnia)(?!mesh)(?!kic)" .. BASE_PTRN
+  local VAL_PTRN  = BASE_PTRN
+
+  local function validate_entry(str, max_size, pattern)
+    if str == "" or #str > max_size then
+      return nil, fmt(
+        "%s must have between 1 and %d characters", str, max_size)
+    end
+    if not re_match(str, pattern, "ajoi") then
+      return nil, fmt("%s is invalid. Must match pattern: %s", str, pattern)
+    end
+    return true
+  end
+
+  -- Validates a label array.
+  -- Validates labels based on the kong Labels AIP
+  function validate_labels(raw_labels)
+    if nkeys(raw_labels) > MAX_KEYS_COUNT then
+      return nil, fmt(
+        "labels validation failed: count exceeded %d max elements",
+        MAX_KEYS_COUNT
+      )
+    end
+
+    for _, kv in ipairs(raw_labels) do
+      local del = kv:find(":", 1, true)
+      local k = del and kv:sub(1, del - 1) or ""
+      local v = del and kv:sub(del + 1) or ""
+
+      local ok, err = validate_entry(k, MAX_KEY_SIZE, KEY_PTRN)
+      if not ok then
+        return nil, "label key validation failed: " .. err
+      end
+      ok, err = validate_entry(v, MAX_VALUE_SIZE, VAL_PTRN)
+      if not ok then
+        return nil, "label value validation failed: " .. err
+      end
+    end
+
+    return true
+  end
+end
+_M.validate_labels = validate_labels
+
+
 ---
 -- Given an http status and an optional message, this function will
 -- return a body that could be used in `kong.response.exit`.
@@ -1177,7 +1236,7 @@ do
   end
 
   -- ngx_str_t defined by lua-resty-core
-  local s = ffi.new("ngx_str_t[1]")
+  local s = ffi_new("ngx_str_t[1]")
   s[0].data = "10"
   s[0].len = 2
 
@@ -1244,6 +1303,7 @@ end
 
 
 local get_mime_type
+local get_response_type
 local get_error_template
 do
   local CONTENT_TYPE_JSON    = "application/json"
@@ -1295,6 +1355,73 @@ do
 ]],
   }
 
+  local ngx_log = ngx.log
+  local ERR     = ngx.ERR
+  local custom_error_templates = setmetatable({}, {
+    __index = function(self, format)
+      local template_path = kong.configuration["error_template_" .. format]
+      if not template_path then
+        rawset(self, format, false)
+        return false
+      end
+
+      local template, err
+      if pl_path.exists(template_path) then
+        template, err = pl_file.read(template_path)
+      else
+        err = "file not found"
+      end
+
+      if template then
+        rawset(self, format, template)
+        return template
+      end
+
+      ngx_log(ERR, fmt("failed reading the custom %s error template: %s", format, err))
+      rawset(self, format, false)
+      return false
+    end
+  })
+
+
+  get_response_type = function(accept_header)
+    local content_type = MIME_TYPES[CONTENT_TYPE_DEFAULT]
+    if type(accept_header) == "table" then
+      accept_header = join(",", accept_header)
+    end
+
+    if accept_header ~= nil then
+      local pattern = [[
+        ((?:[a-z0-9][a-z0-9-!#$&^_+.]+|\*) \/ (?:[a-z0-9][a-z0-9-!#$&^_+.]+|\*))
+        (?:
+          \s*;\s*
+          q = ( 1(?:\.0{0,3}|) | 0(?:\.\d{0,3}|) )
+          | \s*;\s* [a-z0-9][a-z0-9-!#$&^_+.]+ (?:=[^;]*|)
+        )*
+      ]]
+      local accept_values = split(accept_header, ",")
+      local max_quality = 0
+
+      for _, accept_value in ipairs(accept_values) do
+        accept_value = _M.strip(accept_value)
+        local matches = ngx.re.match(accept_value, pattern, "ajoxi")
+
+        if matches then
+          local media_type = matches[1]
+          local q = tonumber(matches[2]) or 1
+
+          if q > max_quality then
+            max_quality = q
+            content_type = get_mime_type(media_type) or content_type
+          end
+        end
+      end
+    end
+
+    return content_type
+  end
+
+
   get_mime_type = function(content_header, use_default)
     use_default = use_default == nil or use_default
     content_header = _M.strip(content_header)
@@ -1305,7 +1432,7 @@ do
     if #entries > 1 then
       if entries[2] == CONTENT_TYPE_ANY then
         if entries[1] == CONTENT_TYPE_ANY then
-          mime_type = MIME_TYPES["default"]
+          mime_type = MIME_TYPES[CONTENT_TYPE_DEFAULT]
         else
           mime_type = MIME_TYPES[entries[1]]
         end
@@ -1315,7 +1442,7 @@ do
     end
 
     if mime_type or use_default then
-      return mime_type or MIME_TYPES["default"]
+      return mime_type or MIME_TYPES[CONTENT_TYPE_DEFAULT]
     end
 
     return nil, "could not find MIME type"
@@ -1324,16 +1451,16 @@ do
 
   get_error_template = function(mime_type)
     if mime_type == CONTENT_TYPE_JSON or mime_type == MIME_TYPES[CONTENT_TYPE_JSON] then
-      return ERROR_TEMPLATES[CONTENT_TYPE_JSON]
+      return custom_error_templates.json or ERROR_TEMPLATES[CONTENT_TYPE_JSON]
 
     elseif mime_type == CONTENT_TYPE_HTML or mime_type == MIME_TYPES[CONTENT_TYPE_HTML] then
-      return ERROR_TEMPLATES[CONTENT_TYPE_HTML]
+      return custom_error_templates.html or ERROR_TEMPLATES[CONTENT_TYPE_HTML]
 
     elseif mime_type == CONTENT_TYPE_XML or mime_type == MIME_TYPES[CONTENT_TYPE_XML] then
-      return ERROR_TEMPLATES[CONTENT_TYPE_XML]
+      return custom_error_templates.xml or ERROR_TEMPLATES[CONTENT_TYPE_XML]
 
     elseif mime_type == CONTENT_TYPE_PLAIN or mime_type == MIME_TYPES[CONTENT_TYPE_PLAIN] then
-      return ERROR_TEMPLATES[CONTENT_TYPE_PLAIN]
+      return custom_error_templates.plain or ERROR_TEMPLATES[CONTENT_TYPE_PLAIN]
 
     elseif mime_type == CONTENT_TYPE_GRPC or mime_type == MIME_TYPES[CONTENT_TYPE_GRPC] then
       return ERROR_TEMPLATES[CONTENT_TYPE_GRPC]
@@ -1345,6 +1472,7 @@ do
 
 end
 _M.get_mime_type = get_mime_type
+_M.get_response_type = get_response_type
 _M.get_error_template = get_error_template
 
 
@@ -1416,8 +1544,29 @@ local topological_sort do
 end
 _M.topological_sort = topological_sort
 
+---
+-- Sort by handler priority and check for collisions. In case of a collision
+-- sorting will be applied based on the plugin's name.
+-- @tparam table plugin table containing `handler` table and a `name` string
+-- @tparam table plugin table containing `handler` table and a `name` string
+-- @treturn boolean outcome of sorting
+function _M.sort_by_handler_priority(a, b)
+  local prio_a = a.handler.PRIORITY or 0
+  local prio_b = b.handler.PRIORITY or 0
+  if prio_a == prio_b and not
+      (prio_a == 0 or prio_b == 0) then
+    return a.name > b.name
+  end
+  return prio_a > prio_b
+end
+
 do
-  local counter = 0
+  local get_phase = ngx.get_phase
+  local ngx_sleep = _G.native_ngx_sleep or ngx.sleep
+
+  local YIELD_ITERATIONS = 1000
+  local counter = YIELD_ITERATIONS
+
   function _M.yield(in_loop, phase)
     if ngx.IS_CLI then
       return
@@ -1427,11 +1576,11 @@ do
       return
     end
     if in_loop then
-      counter = counter + 1
-      if counter % YIELD_ITERATIONS ~= 0 then
+      counter = counter - 1
+      if counter > 0 then
         return
       end
-      counter = 0
+      counter = YIELD_ITERATIONS
     end
     ngx_sleep(0)
   end
@@ -1439,7 +1588,7 @@ end
 
 local time_ns
 do
-  local nanop = ffi.new("nanotime[1]")
+  local nanop = ffi_new("nanotime[1]")
   function time_ns()
     -- CLOCK_REALTIME -> 0
     C.clock_gettime(0, nanop)
@@ -1449,5 +1598,114 @@ do
   end
 end
 _M.time_ns = time_ns
+
+
+local try_decode_base64
+do
+  local decode_base64    = ngx.decode_base64
+  local decode_base64url = require "ngx.base64".decode_base64url
+
+  local function decode_base64_str(str)
+    if type(str) == "string" then
+      return decode_base64(str)
+             or decode_base64url(str)
+             or nil, "base64 decoding failed: invalid input"
+
+    else
+      return nil, "base64 decoding failed: not a string"
+    end
+  end
+
+  function try_decode_base64(value)
+    if type(value) == "table" then
+      for i, v in ipairs(value) do
+        value[i] = decode_base64_str(v) or v
+      end
+
+      return value
+    end
+
+    if type(value) == "string" then
+      return decode_base64_str(value) or value
+    end
+
+    return value
+  end
+end
+_M.try_decode_base64 = try_decode_base64
+
+
+local sha256_bin
+do
+  local digest = require "resty.openssl.digest"
+  local sha256_digest
+
+  function sha256_bin(key)
+    local _, bin, err
+    if not sha256_digest then
+      sha256_digest, err = digest.new("sha256")
+      if err then
+        return nil, err
+      end
+    end
+
+    bin, err = sha256_digest:final(key)
+    if err then
+      sha256_digest = nil
+      return nil, err
+    end
+
+    _, err = sha256_digest:reset()
+    if err then
+      sha256_digest = nil
+    end
+
+    return bin
+  end
+end
+_M.sha256_bin = sha256_bin
+
+
+local sha256_hex, sha256_base64, sha256_base64url
+do
+  local to_hex       = require "resty.string".to_hex
+  local to_base64    = ngx.encode_base64
+  local to_base64url = require "ngx.base64".encode_base64url
+
+  local function sha256_encode(encode_alg, key)
+    local bin, err = sha256_bin(key)
+    if err then
+      return nil, err
+    end
+
+    return encode_alg(bin)
+  end
+
+  function sha256_hex(key)
+    return sha256_encode(to_hex, key)
+  end
+
+  function sha256_base64(key)
+    return sha256_encode(to_base64, key)
+  end
+
+  function sha256_base64url(key)
+    return sha256_encode(to_base64url, key)
+  end
+end
+_M.sha256_hex       = sha256_hex
+_M.sha256_base64    = sha256_base64
+_M.sha256_base64url = sha256_base64url
+
+local get_updated_now_ms
+do
+  local now           = ngx.now
+  local update_time   = ngx.update_time
+  function get_updated_now_ms()
+    update_time()
+    return now() * 1000 -- time is kept in seconds with millisecond resolution.
+  end
+end
+_M.get_updated_now_ms = get_updated_now_ms
 
 return _M

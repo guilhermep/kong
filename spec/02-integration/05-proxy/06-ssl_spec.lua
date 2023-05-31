@@ -1,6 +1,7 @@
 local ssl_fixtures = require "spec.fixtures.ssl"
 local helpers      = require "spec.helpers"
 local cjson        = require "cjson"
+local fmt          = string.format
 
 
 local function get_cert(server_name)
@@ -12,8 +13,35 @@ local function get_cert(server_name)
   return stdout
 end
 
+local mock_tls_server_port = helpers.get_available_port()
+
+local fixtures = {
+  dns_mock = helpers.dns_mock.new({ mocks_only = true }),
+  http_mock = {
+    test_upstream_tls_server = fmt([[
+      server {
+          server_name example2.com;
+          listen %s ssl;
+
+          ssl_certificate        ../spec/fixtures/mtls_certs/example2.com.crt;
+          ssl_certificate_key    ../spec/fixtures/mtls_certs/example2.com.key;
+
+          location = / {
+              echo 'it works';
+          }
+      }
+    ]], mock_tls_server_port)
+  },
+}
+
+fixtures.dns_mock:A {
+  name = "example2.com",
+  address = "127.0.0.1",
+}
+
+for _, flavor in ipairs({ "traditional", "traditional_compatible" }) do
 for _, strategy in helpers.each_strategy() do
-  describe("SSL [#" .. strategy .. "]", function()
+  describe("SSL [#" .. strategy .. ", flavor = " .. flavor .. "]", function()
     local proxy_client
     local https_client
 
@@ -126,16 +154,18 @@ for _, strategy in helpers.each_strategy() do
         preserve_host = false,
       }
 
-      local service_mockbin = assert(bp.services:insert {
-        name     = "service-mockbin",
-        url      = "https://mockbin.com/request",
+      local service_example2 = assert(bp.services:insert {
+        name     = "service-example2",
+        protocol = "https",
+        host     = "example2.com",
+        port     = mock_tls_server_port,
       })
 
       assert(bp.routes:insert {
         protocols     = { "http" },
-        hosts         = { "mockbin.com" },
+        hosts         = { "example2.com" },
         paths         = { "/" },
-        service       = service_mockbin,
+        service       = service_example2,
       })
 
       assert(bp.routes:insert {
@@ -204,13 +234,15 @@ for _, strategy in helpers.each_strategy() do
 
       -- /wildcard tests
 
-      assert(helpers.start_kong {
+      assert(helpers.start_kong({
+        router_flavor = flavor,
         database    = strategy,
         nginx_conf  = "spec/fixtures/custom_nginx.template",
         trusted_ips = "127.0.0.1",
         nginx_http_proxy_ssl_verify = "on",
         nginx_http_proxy_ssl_trusted_certificate = "../spec/fixtures/kong_spec.crt",
-      })
+        nginx_http_proxy_ssl_verify_depth = "5",
+      }, nil, nil, fixtures))
 
       ngx.sleep(0.01)
 
@@ -230,13 +262,13 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/",
           headers = {
-            Host  = "mockbin.com",
+            Host  = "example2.com",
           },
         })
         local body = assert.res_status(502, res)
         assert.equal("An invalid response was received from the upstream server", body)
         assert.logfile().has.line("upstream SSL certificate verify error: " ..
-                                  "(20:unable to get local issuer certificate) " ..
+                                  "(21:unable to verify the first certificate) " ..
                                   "while SSL handshaking to upstream", true, 2)
       end)
 
@@ -373,6 +405,7 @@ for _, strategy in helpers.each_strategy() do
       describe("from not trusted_ip", function()
         lazy_setup(function()
           assert(helpers.restart_kong {
+            router_flavor = flavor,
             database    = strategy,
             nginx_conf  = "spec/fixtures/custom_nginx.template",
             trusted_ips = nil,
@@ -397,6 +430,7 @@ for _, strategy in helpers.each_strategy() do
       describe("from trusted_ip", function()
         lazy_setup(function()
           assert(helpers.restart_kong {
+            router_flavor = flavor,
             database    = strategy,
             nginx_conf  = "spec/fixtures/custom_nginx.template",
             trusted_ips = "127.0.0.1",
@@ -437,6 +471,7 @@ for _, strategy in helpers.each_strategy() do
         -- untrusted ip
         lazy_setup(function()
           assert(helpers.restart_kong {
+            router_flavor = flavor,
             database = strategy,
             nginx_conf  = "spec/fixtures/custom_nginx.template",
             trusted_ips = "1.2.3.4", -- explicitly trust an IP that is not us
@@ -465,6 +500,7 @@ for _, strategy in helpers.each_strategy() do
 
       before_each(function()
         assert(helpers.restart_kong {
+          router_flavor = flavor,
           database = strategy,
           nginx_conf  = "spec/fixtures/custom_nginx.template",
         })
@@ -519,7 +555,7 @@ for _, strategy in helpers.each_strategy() do
     end)
   end)
 
-  describe("TLS proxy [#" .. strategy .. "]", function()
+  describe("TLS proxy [#" .. strategy .. ", flavor = " .. flavor .. "]", function()
     lazy_setup(function()
       local bp = helpers.get_db_utils(strategy, {
         "routes",
@@ -540,7 +576,7 @@ for _, strategy in helpers.each_strategy() do
         snis     = { "example.com" },
         service   = service,
       }
-      
+
       bp.routes:insert {
         protocols = { "tls" },
         snis      = { "foobar.example.com." },
@@ -560,11 +596,12 @@ for _, strategy in helpers.each_strategy() do
       }
 
       assert(helpers.start_kong {
+        router_flavor = flavor,
         database    = strategy,
         stream_listen = "127.0.0.1:9020 ssl"
       })
 
-    
+
     end)
 
     lazy_teardown(function()
@@ -613,7 +650,7 @@ for _, strategy in helpers.each_strategy() do
     end)
   end)
 
-  describe("SSL [#" .. strategy .. "]", function()
+  describe("SSL [#" .. strategy .. ", flavor = " .. flavor .. "]", function()
 
     lazy_setup(function()
       local bp = helpers.get_db_utils(strategy, {
@@ -646,6 +683,7 @@ for _, strategy in helpers.each_strategy() do
       }
 
       assert(helpers.start_kong {
+        router_flavor = flavor,
         database    = strategy,
         nginx_conf  = "spec/fixtures/custom_nginx.template",
       })
@@ -663,4 +701,71 @@ for _, strategy in helpers.each_strategy() do
       end)
     end)
   end)
+
+  describe("kong.runloop.certificate invalid SNI [#" .. strategy .. ", flavor = " .. flavor .. "]", function()
+    lazy_setup(function()
+      assert(helpers.start_kong {
+        router_flavor = flavor,
+        database    = strategy,
+      })
+    end)
+
+    lazy_teardown(function()
+      helpers.stop_kong()
+    end)
+
+    before_each(function()
+      helpers.clean_logfile()
+    end)
+
+    it("normal sni", function()
+      get_cert("a.example.com")
+      assert.logfile().has.no.line("[error]", true)
+      assert.logfile().has.no.line("invalid SNI", true)
+    end)
+
+    it("must not have a port", function()
+      get_cert("a.example.com:600")
+      assert.logfile().has.no.line("[error]", true)
+      assert.logfile().has.line("invalid SNI 'a.example.com:600', must not have a port", true)
+    end)
+
+    it("must not have a port (invalid port)", function()
+      get_cert("a.example.com:88888")
+      assert.logfile().has.no.line("[error]", true)
+      assert.logfile().has.line("invalid SNI 'a.example.com:88888', must not have a port", true)
+    end)
+
+    it("must not be an IP", function()
+      get_cert("127.0.0.1")
+      assert.logfile().has.no.line("[error]", true)
+      assert.logfile().has.line("invalid SNI '127.0.0.1', must not be an IP", true)
+    end)
+
+    it("must not be an IP (with port)", function()
+      get_cert("127.0.0.1:443")
+      assert.logfile().has.no.line("[error]", true)
+      assert.logfile().has.line("invalid SNI '127.0.0.1:443', must not be an IP", true)
+    end)
+
+    it("invalid value", function()
+      get_cert("256.256.256.256")
+      assert.logfile().has.no.line("[error]", true)
+      assert.logfile().has.line("invalid SNI '256.256.256.256', invalid value: ", true)
+    end)
+
+    it("only one wildcard must be specified", function()
+      get_cert("*.exam*le.com")
+      assert.logfile().has.no.line("[error]", true)
+      assert.logfile().has.line("invalid SNI '*.exam*le.com', only one wildcard must be specified", true)
+    end)
+
+    it("wildcard must be leftmost or rightmost character", function()
+      get_cert("a.exam*le.com")
+      assert.logfile().has.no.line("[error]", true)
+      assert.logfile().has.line("invalid SNI 'a.exam*le.com', wildcard must be leftmost or rightmost character", true)
+    end)
+
+  end)
+end
 end

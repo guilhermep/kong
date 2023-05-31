@@ -68,7 +68,7 @@ describe("[DNS client cache]", function()
     local lrucache, mock_records, config
     before_each(function()
       config = {
-        nameservers = { "8.8.8.8" },
+        nameservers = { "198.51.100.0" },
         ndots = 1,
         search = { "domain.com" },
         hosts = {},
@@ -268,7 +268,7 @@ describe("[DNS client cache]", function()
     local lrucache, mock_records, config
     before_each(function()
       config = {
-        nameservers = { "8.8.8.8" },
+        nameservers = { "198.51.100.0" },
         ndots = 1,
         search = { "domain.com" },
         hosts = {},
@@ -305,7 +305,7 @@ describe("[DNS client cache]", function()
       assert.equal(rec1, lrucache:get(client.TYPE_A..":myhost9.domain.com"))
 
       sleep(0.15) -- make sure we surpass the ttl of 0.1 of the record, so it is now stale.
-      -- new mock records, such that we return server failures instaed of records
+      -- new mock records, such that we return server failures installed of records
       local rec2 = {
         errcode = 4,
         errstr = "server failure",
@@ -448,7 +448,7 @@ describe("[DNS client cache]", function()
     local lrucache, mock_records, config  -- luacheck: ignore
     before_each(function()
       config = {
-        nameservers = { "8.8.8.8" },
+        nameservers = { "198.51.100.0" },
         ndots = 1,
         search = { "domain.com" },
         hosts = {},
@@ -561,7 +561,7 @@ describe("[DNS client cache]", function()
     local lrucache, mock_records, config  -- luacheck: ignore
     before_each(function()
       config = {
-        nameservers = { "8.8.8.8" },
+        nameservers = { "198.51.100.0" },
         hosts = {"127.0.0.1 myname.lan"},
         resolvConf = {},
         validTtl = 0.1,

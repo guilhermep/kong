@@ -167,11 +167,12 @@ describe("declarative config: flatten", function()
       end)
 
       it("accepts field names with the same name as entities", function()
+        -- "snis" is also an entity
         local config = assert(lyaml.load([[
           _format_version: "1.1"
           routes:
           - name: foo
-            path_handling: v1
+            path_handling: v0
             protocols: ["tls"]
             snis:
             - "example.com"
@@ -197,7 +198,7 @@ describe("declarative config: flatten", function()
               snis = { "example.com" },
               sources = null,
               strip_path = true,
-              path_handling = "v1",
+              path_handling = "v0",
               updated_at = 1234567890,
               request_buffering = true,
               response_buffering = true,
@@ -274,33 +275,46 @@ describe("declarative config: flatten", function()
               id = "UUID",
               tags = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               consumer = null,
               service = null,
               route = null,
               name = "http-log",
+              instance_name = null,
               enabled = true,
               protocols = { "grpc", "grpcs", "http", "https" },
               config = {
                 http_endpoint = "https://example.com",
                 content_type = "application/json",
-                flush_timeout = 2,
+                flush_timeout = null,
                 keepalive = 60000,
                 method = "POST",
-                queue_size = 1,
-                retry_count = 10,
+                queue_size = null,
+                retry_count = null,
                 timeout = 10000,
                 headers = null,
                 custom_fields_by_lua = null,
+                queue = {
+                  initial_retry_delay = 0.01,
+                  max_batch_size = 1,
+                  max_entries = 10000,
+                  max_coalescing_delay = 1,
+                  max_retry_delay = 60,
+                  max_retry_time = 60,
+                  max_bytes = null,
+                },
               }
             },
             {
               id = "UUID",
               tags = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               consumer = null,
               service = null,
               route = null,
               name = "key-auth",
+              instance_name = null,
               enabled = true,
               protocols = { "grpc", "grpcs", "http", "https" },
               config = {
@@ -346,7 +360,7 @@ describe("declarative config: flatten", function()
               host: example.com
           routes:
             - name: r1
-              path_handling: v1
+              path_handling: v0
               paths: [/]
               service: svc1
           consumers:
@@ -366,6 +380,7 @@ describe("declarative config: flatten", function()
             {
               tags = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               custom_id = null,
               id = "UUID",
               username = "my-consumer",
@@ -376,23 +391,34 @@ describe("declarative config: flatten", function()
               tags = null,
               config = {
                 content_type = "application/json",
-                flush_timeout = 2,
+                flush_timeout = null,
                 http_endpoint = "https://example.com",
                 keepalive = 60000,
                 method = "POST",
-                queue_size = 1,
-                retry_count = 10,
+                queue_size = null,
+                retry_count = null,
                 timeout = 10000,
                 headers = null,
                 custom_fields_by_lua = null,
+                queue = {
+                  initial_retry_delay = 0.01,
+                  max_batch_size = 1,
+                  max_entries = 10000,
+                  max_coalescing_delay = 1,
+                  max_retry_delay = 60,
+                  max_retry_time = 60,
+                  max_bytes = null,
+                },
               },
               consumer = {
                 id = "UUID"
               },
               created_at = 1234567890,
+              updated_at = 1234567890,
               enabled = true,
               id = "UUID",
               name = "http-log",
+              instance_name = null,
               route = null,
               protocols = { "grpc", "grpcs", "http", "https" },
               service = {
@@ -412,9 +438,11 @@ describe("declarative config: flatten", function()
               },
               consumer = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               enabled = true,
               id = "UUID",
               name = "key-auth",
+              instance_name = null,
               route = {
                 id = "UUID"
               },
@@ -443,7 +471,7 @@ describe("declarative config: flatten", function()
               snis = null,
               sources = null,
               strip_path = true,
-              path_handling = "v1",
+              path_handling = "v0",
               updated_at = 1234567890,
               request_buffering = true,
               response_buffering = true,
@@ -549,9 +577,11 @@ describe("declarative config: flatten", function()
                 },
                 consumer = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 enabled = true,
                 id = "UUID",
                 name = "basic-auth",
+                instance_name = null,
                 protocols = { "grpc", "grpcs", "http", "https" },
                 route = null,
                 service = {
@@ -561,21 +591,32 @@ describe("declarative config: flatten", function()
               }, {
                 config = {
                   content_type = "application/json",
-                  flush_timeout = 2,
+                  flush_timeout = null,
                   http_endpoint = "https://example.com",
                   keepalive = 60000,
                   method = "POST",
-                  queue_size = 1,
-                  retry_count = 10,
+                  queue_size = null,
+                  retry_count = null,
                   timeout = 10000,
                   headers = null,
                   custom_fields_by_lua = null,
+                  queue = {
+                    initial_retry_delay = 0.01,
+                    max_batch_size = 1,
+                    max_entries = 10000,
+                    max_coalescing_delay = 1,
+                    max_retry_delay = 60,
+                    max_retry_time = 60,
+                    max_bytes = null,
+                  }
                 },
                 consumer = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 enabled = true,
                 id = "UUID",
                 name = "http-log",
+                instance_name = null,
                 protocols = { "grpc", "grpcs", "http", "https" },
                 route = null,
                 service = {
@@ -594,9 +635,11 @@ describe("declarative config: flatten", function()
                 },
                 consumer = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 enabled = true,
                 id = "UUID",
                 name = "key-auth",
+                instance_name = null,
                 protocols = { "grpc", "grpcs", "http", "https" },
                 route = null,
                 service = {
@@ -615,9 +658,11 @@ describe("declarative config: flatten", function()
                 },
                 consumer = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 enabled = true,
                 id = "UUID",
                 name = "tcp-log",
+                instance_name = null,
                 protocols = { "grpc", "grpcs", "http", "https" },
                 route = null,
                 service = {
@@ -712,7 +757,7 @@ describe("declarative config: flatten", function()
               host: example.com
               protocol: https
               routes:
-                - path_handling: v1
+                - path_handling: v0
                   paths:
                   - /path
           ]]))
@@ -737,7 +782,7 @@ describe("declarative config: flatten", function()
                 snis = null,
                 sources = null,
                 strip_path = true,
-                path_handling = "v1",
+                path_handling = "v0",
                 tags = null,
                 updated_at = 1234567890,
                 request_buffering = true,
@@ -774,22 +819,22 @@ describe("declarative config: flatten", function()
               host: example.com
               protocol: https
               routes:
-                - path_handling: v1
+                - path_handling: v0
                   paths:
                   - /path
                   name: r1
-                - path_handling: v1
+                - path_handling: v0
                   hosts:
                   - example.com
                   name: r2
-                - path_handling: v1
+                - path_handling: v0
                   methods: ["GET", "POST"]
                   name: r3
             - name: bar
               host: example.test
               port: 3000
               routes:
-                - path_handling: v1
+                - path_handling: v0
                   paths:
                   - /path
                   hosts:
@@ -818,7 +863,7 @@ describe("declarative config: flatten", function()
                 snis = null,
                 sources = null,
                 strip_path = true,
-                path_handling = "v1",
+                path_handling = "v0",
                 tags = null,
                 updated_at = 1234567890,
                 request_buffering = true,
@@ -842,7 +887,7 @@ describe("declarative config: flatten", function()
                 snis = null,
                 sources = null,
                 strip_path = true,
-                path_handling = "v1",
+                path_handling = "v0",
                 tags = null,
                 updated_at = 1234567890,
                 request_buffering = true,
@@ -866,7 +911,7 @@ describe("declarative config: flatten", function()
                 snis = null,
                 sources = null,
                 strip_path = true,
-                path_handling = "v1",
+                path_handling = "v0",
                 tags = null,
                 updated_at = 1234567890,
                 request_buffering = true,
@@ -890,7 +935,7 @@ describe("declarative config: flatten", function()
                 snis = null,
                 sources = null,
                 strip_path = true,
-                path_handling = "v1",
+                path_handling = "v0",
                 tags = null,
                 updated_at = 1234567890,
                 request_buffering = true,
@@ -949,7 +994,7 @@ describe("declarative config: flatten", function()
               protocol: https
               routes:
               - name: foo
-                path_handling: v1
+                path_handling: v0
                 methods: ["GET"]
                 plugins:
           ]]))
@@ -976,7 +1021,7 @@ describe("declarative config: flatten", function()
                 snis = null,
                 sources = null,
                 strip_path = true,
-                path_handling = "v1",
+                path_handling = "v0",
                 updated_at = 1234567890,
                 request_buffering = true,
                 response_buffering = true,
@@ -1016,7 +1061,7 @@ describe("declarative config: flatten", function()
               protocol: https
               routes:
               - name: foo
-                path_handling: v1
+                path_handling: v0
                 methods: ["GET"]
                 plugins:
                   - name: key-auth
@@ -1028,7 +1073,7 @@ describe("declarative config: flatten", function()
               port: 3000
               routes:
               - name: bar
-                path_handling: v1
+                path_handling: v0
                 paths:
                 - /
                 plugins:
@@ -1047,9 +1092,11 @@ describe("declarative config: flatten", function()
                 },
                 consumer = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 enabled = true,
                 id = "UUID",
                 name = "basic-auth",
+                instance_name = null,
                 protocols = { "grpc", "grpcs", "http", "https" },
                 route = {
                   id = "UUID"
@@ -1059,21 +1106,32 @@ describe("declarative config: flatten", function()
               }, {
                 config = {
                   content_type = "application/json",
-                  flush_timeout = 2,
+                  flush_timeout = null,
                   http_endpoint = "https://example.com",
                   keepalive = 60000,
                   method = "POST",
-                  queue_size = 1,
-                  retry_count = 10,
+                  queue_size = null,
+                  retry_count = null,
                   timeout = 10000,
                   headers = null,
                   custom_fields_by_lua = null,
+                  queue = {
+                    initial_retry_delay = 0.01,
+                    max_batch_size = 1,
+                    max_entries = 10000,
+                    max_coalescing_delay = 1,
+                    max_retry_delay = 60,
+                    max_retry_time = 60,
+                    max_bytes = null,
+                  },
                 },
                 consumer = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 enabled = true,
                 id = "UUID",
                 name = "http-log",
+                instance_name = null,
                 protocols = { "grpc", "grpcs", "http", "https" },
                 route = {
                   id = "UUID"
@@ -1092,9 +1150,11 @@ describe("declarative config: flatten", function()
                 },
                 consumer = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 enabled = true,
                 id = "UUID",
                 name = "key-auth",
+                instance_name = null,
                 protocols = { "grpc", "grpcs", "http", "https" },
                 route = {
                   id = "UUID"
@@ -1113,9 +1173,11 @@ describe("declarative config: flatten", function()
                 },
                 consumer = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 enabled = true,
                 id = "UUID",
                 name = "tcp-log",
+                instance_name = null,
                 protocols = { "grpc", "grpcs", "http", "https" },
                 route = {
                   id = "UUID"
@@ -1142,7 +1204,7 @@ describe("declarative config: flatten", function()
                 snis = null,
                 sources = null,
                 strip_path = true,
-                path_handling = "v1",
+                path_handling = "v0",
                 tags = null,
                 updated_at = 1234567890,
                 request_buffering = true,
@@ -1166,7 +1228,7 @@ describe("declarative config: flatten", function()
                 snis = null,
                 sources = null,
                 strip_path = true,
-                path_handling = "v1",
+                path_handling = "v0",
                 tags = null,
                 updated_at = 1234567890,
                 request_buffering = true,
@@ -1234,6 +1296,7 @@ describe("declarative config: flatten", function()
           targets = {
             {
               created_at = 1234567890,
+              updated_at = 1234567890,
               id = "UUID",
               tags = null,
               target = '127.0.0.1:6661',
@@ -1242,6 +1305,7 @@ describe("declarative config: flatten", function()
             },
             {
               created_at = 1234567890,
+              updated_at = 1234567890,
               id = "UUID",
               tags = null,
               target = '127.0.0.1:6661',
@@ -1287,6 +1351,7 @@ describe("declarative config: flatten", function()
               username = 'consumer',
               custom_id = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               tags = null,
             },
           },
@@ -1310,6 +1375,7 @@ describe("declarative config: flatten", function()
               username = 'consumer',
               custom_id = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               tags = null,
             },
           },
@@ -1347,6 +1413,7 @@ describe("declarative config: flatten", function()
               username = 'consumer',
               custom_id = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               tags = null,
             },
           },
@@ -1413,6 +1480,7 @@ describe("declarative config: flatten", function()
               username = 'consumer',
               custom_id = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               tags = null,
             },
           },
@@ -1479,6 +1547,7 @@ describe("declarative config: flatten", function()
               username = 'consumer',
               custom_id = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               tags = null,
             },
           },
@@ -1544,6 +1613,7 @@ describe("declarative config: flatten", function()
               username = 'consumer',
               custom_id = null,
               created_at = 1234567890,
+              updated_at = 1234567890,
               tags = null,
             },
           },
@@ -1703,6 +1773,7 @@ describe("declarative config: flatten", function()
           assert.same({
             consumers = { {
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 custom_id = null,
                 id = "UUID",
                 tags = null,
@@ -1743,6 +1814,7 @@ describe("declarative config: flatten", function()
           assert.same(helpers.deep_sort{
             targets = { {
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 id = "UUID",
                 tags = null,
                 target = "127.0.0.1:6661",
@@ -1752,6 +1824,7 @@ describe("declarative config: flatten", function()
                 weight = 1,
               }, {
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 id = "UUID",
                 tags = null,
                 target = "127.0.0.1:6661",
@@ -1764,6 +1837,7 @@ describe("declarative config: flatten", function()
                 algorithm = "round-robin",
                 client_certificate = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 hash_fallback = "none",
                 hash_fallback_header = null,
                 hash_on = "none",
@@ -1774,6 +1848,7 @@ describe("declarative config: flatten", function()
                 hash_fallback_query_arg = null,
                 hash_on_uri_capture = null,
                 hash_fallback_uri_capture = null,
+                use_srv_name = false,
                 healthchecks = {
                   active = {
                     concurrency = 10,
@@ -1820,6 +1895,7 @@ describe("declarative config: flatten", function()
                 algorithm = "round-robin",
                 client_certificate = null,
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 hash_fallback = "none",
                 hash_fallback_header = null,
                 hash_on = "none",
@@ -1830,6 +1906,7 @@ describe("declarative config: flatten", function()
                 hash_fallback_query_arg = null,
                 hash_on_uri_capture = null,
                 hash_fallback_uri_capture = null,
+                use_srv_name = false,
                 healthchecks = {
                   active = {
                     concurrency = 10,
@@ -1892,6 +1969,7 @@ describe("declarative config: flatten", function()
           assert.same({
             consumers = { {
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 custom_id = null,
                 id = "UUID",
                 tags = null,
@@ -1918,6 +1996,7 @@ describe("declarative config: flatten", function()
           assert.same({
             consumers = { {
                 created_at = 1234567890,
+                updated_at = 1234567890,
                 custom_id = null,
                 id = "UUID",
                 tags = null,

@@ -8,13 +8,14 @@ local kong = kong
 local type = type
 local error = error
 local ipairs = ipairs
+local pairs = pairs
 local tostring = tostring
 local re_gmatch = ngx.re.gmatch
 
 
 local JwtHandler = {
-  PRIORITY = 1005,
   VERSION = kong_meta.version,
+  PRIORITY = 1450,
 }
 
 
@@ -24,11 +25,22 @@ local JwtHandler = {
 -- @param conf Plugin configuration
 -- @return token JWT token contained in request (can be a table) or nil
 -- @return err
-local function retrieve_token(conf)
+local function retrieve_tokens(conf)
+  local token_set = {}
   local args = kong.request.get_query()
   for _, v in ipairs(conf.uri_param_names) do
-    if args[v] then
-      return args[v]
+    local token = args[v] -- can be a table
+    if token then
+      if type(token) == "table" then
+        for _, t in ipairs(token) do
+          if t ~= "" then
+            token_set[t] = true
+          end
+        end
+
+      elseif token ~= "" then
+        token_set[token] = true
+      end
     end
   end
 
@@ -36,7 +48,7 @@ local function retrieve_token(conf)
   for _, v in ipairs(conf.cookie_names) do
     local cookie = var["cookie_" .. v]
     if cookie and cookie ~= "" then
-      return cookie
+      token_set[cookie] = true
     end
   end
 
@@ -60,10 +72,29 @@ local function retrieve_token(conf)
       end
 
       if m and #m > 0 then
-        return m[1]
+        if m[1] ~= "" then
+          token_set[m[1]] = true
+        end
       end
     end
   end
+
+  local tokens_n = 0
+  local tokens = {}
+  for token, _ in pairs(token_set) do
+    tokens_n = tokens_n + 1
+    tokens[tokens_n] = token
+  end
+
+  if tokens_n == 0 then
+    return nil
+  end
+
+  if tokens_n == 1 then
+    return tokens[1]
+  end
+
+  return tokens
 end
 
 
@@ -112,18 +143,12 @@ local function set_consumer(consumer, credential, token)
     set_header(constants.HEADERS.ANONYMOUS, true)
   end
 
-  if token then
-    kong.ctx.shared.authenticated_jwt_token = token -- TODO: wrap in a PDK function?
-    ngx.ctx.authenticated_jwt_token = token  -- backward compatibility only
-  else
-    kong.ctx.shared.authenticated_jwt_token = nil
-    ngx.ctx.authenticated_jwt_token = nil  -- backward compatibility only
-  end
+  kong.ctx.shared.authenticated_jwt_token = token -- TODO: wrap in a PDK function?
 end
 
 
 local function do_authentication(conf)
-  local token, err = retrieve_token(conf)
+  local token, err = retrieve_tokens(conf)
   if err then
     return error(err)
   end

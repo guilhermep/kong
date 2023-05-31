@@ -30,7 +30,10 @@ describe("kong.log.serialize", function()
           request_length = "200",
           bytes_sent = "99",
           request_time = "2",
-          remote_addr = "1.1.1.1"
+          remote_addr = "1.1.1.1",
+          -- may be a non-numeric string, 
+          -- see http://nginx.org/en/docs/http/ngx_http_upstream_module.html#var_upstream_addr
+          upstream_status = "500, 200 : 200, 200",
         },
         update_time = ngx.update_time,
         sleep = ngx.sleep,
@@ -74,6 +77,7 @@ describe("kong.log.serialize", function()
         assert.same({"arg1", "arg2"}, res.request.querystring)
         assert.equal("http://test.com:80/request_uri", res.request.url)
         assert.equal("/upstream_uri", res.upstream_uri)
+        assert.equal("500, 200 : 200, 200", res.upstream_status)
         assert.equal(200, res.request.size)
         assert.equal("/request_uri", res.request.uri)
 
@@ -169,6 +173,18 @@ describe("kong.log.serialize", function()
         assert.is_table(res)
 
         assert.is_nil(res.tries)
+      end)
+
+      it("includes query args in upstream_uri when they are not found in " ..
+         "var.upstream_uri and exist in var.args", function()
+        local args = "arg1=foo&arg2=bar"
+        ngx.var.is_args = "?"
+        ngx.var.args = args
+
+        local res = kong.log.serialize({ngx = ngx, kong = kong, })
+        assert.is_table(res)
+
+        assert.equal("/upstream_uri" .. "?" .. args, res.upstream_uri)
       end)
     end)
   end)

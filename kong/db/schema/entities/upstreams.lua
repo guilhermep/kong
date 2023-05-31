@@ -179,10 +179,11 @@ local r =  {
   fields = {
     { id = typedefs.uuid, },
     { created_at = typedefs.auto_timestamp_s },
+    { updated_at = typedefs.auto_timestamp_s },
     { name = { type = "string", required = true, unique = true, custom_validator = validate_name }, },
     { algorithm = { type = "string",
         default = "round-robin",
-        one_of = { "consistent-hashing", "least-connections", "round-robin" },
+        one_of = { "consistent-hashing", "least-connections", "round-robin", "latency" },
     }, },
     { hash_on = hash_on },
     { hash_fallback = hash_on },
@@ -202,6 +203,7 @@ local r =  {
     { tags = typedefs.tags },
     { host_header = typedefs.host_with_optional_port },
     { client_certificate = { type = "foreign", reference = "certificates" }, },
+    { use_srv_name =  { type = "boolean", default = false, }, },
   },
   entity_checks = {
     -- hash_on_header must be present when hashing on header
@@ -306,6 +308,11 @@ local r =  {
             algorithm = value,
             hash_on = null,
           }
+         elseif value == "latency" then
+            return {
+              algorithm = value,
+              hash_on = null,
+            }
         else
           return {
             algorithm = value,

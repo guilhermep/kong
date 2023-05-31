@@ -44,15 +44,24 @@ service Bouncer {
       get: "/v1/grow/tail"
     };
   }
+
+  rpc Echo(EchoMsg) returns (EchoMsg) {
+    option (google.api.http) = {
+      post: "/v1/echo"
+      body: "*"
+    };
+  }
 }
 
 
 message HelloRequest {
   string greeting = 1;
+  bool boolean_test = 2;
 }
 
 message HelloResponse {
   string reply = 1;
+  bool boolean_test = 2;
 }
 
 
@@ -78,4 +87,9 @@ message Body {
   Limb hands = 2;
   Limb legs = 3;
   Limb tail = 4;
+}
+
+message EchoMsg {
+  repeated string array = 1;
+  string nullable = 2;
 }

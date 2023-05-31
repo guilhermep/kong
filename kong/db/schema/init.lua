@@ -3,6 +3,7 @@ local pretty       = require "pl.pretty"
 local utils        = require "kong.tools.utils"
 local cjson        = require "cjson"
 local new_tab      = require "table.new"
+local nkeys        = require "table.nkeys"
 local is_reference = require "kong.pdk.vault".new().is_reference
 
 
@@ -1109,7 +1110,6 @@ validate_fields = function(self, input)
   for k, v in pairs(input) do
     local err
     local field = self.fields[tostring(k)]
-    local is_ttl = k == "ttl" and self.ttl
     if field and field.type == "self" then
       local pok
       pok, err, errors[k] = pcall(self.validate_field, self, input, v)
@@ -1117,8 +1117,8 @@ validate_fields = function(self, input)
         errors[k] = validation_errors.SCHEMA_CANNOT_VALIDATE
         kong.log.debug(errors[k], ": ", err)
       end
-    elseif is_ttl then
-      kong.log.debug("ignoring validation on ttl field")
+    elseif self.unvalidated_fields[k]() then
+      kong.log.debug("ignoring validation on ", k, " field")
     else
       field, err = resolve_field(self, k, field, subschema)
       if field then
@@ -1200,6 +1200,7 @@ local function run_entity_check(self, name, input, arg, full_check, errors)
     local value = get_field(input, fname)
     if value == nil then
       if (not checker.run_with_missing_fields) and
+         (not arg.run_with_missing_fields) and
          (required_fields and required_fields[fname]) and
          (not get_schema_field(self, fname).nilable) then
         missing = missing or {}
@@ -1364,45 +1365,49 @@ local function run_transformation_checks(schema_or_subschema, input, original_in
   if transformations then
     for i = 1, #transformations do
       local transformation = transformations[i]
-      local args = {}
-      local argc = 0
-      local none_set = true
-      for j = 1, #transformation.input do
-        local input_field_name = transformation.input[j]
-        if is_nonempty(get_field(original_input or input, input_field_name)) then
-          none_set = false
-        end
-
-        argc = argc + 1
-        args[argc] = input_field_name
-      end
-
-      local needs_changed = false
-      if transformation.needs then
-        for j = 1, #transformation.needs do
-          local input_field_name = transformation.needs[j]
-          if rbw_entity and not needs_changed then
-            local value = get_field(original_input or input, input_field_name)
-            local rbw_value = get_field(rbw_entity, input_field_name)
-            if value ~= rbw_value then
-              needs_changed = true
+      if transformation.input or transformation.needs then
+        local args = {}
+        local argc = 0
+        local none_set = true
+        if transformation.input then
+          for j = 1, #transformation.input do
+            local input_field_name = transformation.input[j]
+            if is_nonempty(get_field(original_input or input, input_field_name)) then
+              none_set = false
             end
+
+            argc = argc + 1
+            args[argc] = input_field_name
           end
-
-          argc = argc + 1
-          args[argc] = input_field_name
         end
-      end
 
-      if needs_changed or (not none_set) then
-        local ok, err = mutually_required(needs_changed and original_input or input, args)
-        if not ok then
-          insert_entity_error(errors, validation_errors.MUTUALLY_REQUIRED:format(err))
+        local needs_changed = false
+        if transformation.needs then
+          for j = 1, #transformation.needs do
+            local input_field_name = transformation.needs[j]
+            if rbw_entity and not needs_changed then
+              local value = get_field(original_input or input, input_field_name)
+              local rbw_value = get_field(rbw_entity, input_field_name)
+              if value ~= rbw_value then
+                needs_changed = true
+              end
+            end
 
-        else
-          ok, err = mutually_required(original_input or input, transformation.input)
+            argc = argc + 1
+            args[argc] = input_field_name
+          end
+        end
+
+        if needs_changed or (not none_set) then
+          local ok, err = mutually_required(needs_changed and original_input or input, args)
           if not ok then
             insert_entity_error(errors, validation_errors.MUTUALLY_REQUIRED:format(err))
+
+          else
+            ok, err = mutually_required(original_input or input, transformation.input)
+            if not ok then
+              insert_entity_error(errors, validation_errors.MUTUALLY_REQUIRED:format(err))
+            end
           end
         end
       end
@@ -1659,14 +1664,11 @@ function Schema:process_auto_fields(data, context, nulls, opts)
   end
 
   local refs
+  local prev_refs = resolve_references and data["$refs"]
 
   for key, field in self:each_field(data) do
     local ftype = field.type
     local value = data[key]
-    if field.legacy and field.uuid and value == "" then
-      value = null
-    end
-
     if not is_select and field.auto then
       local is_insert_or_upsert = context == "insert" or context == "upsert"
       if field.uuid then
@@ -1701,7 +1703,11 @@ function Schema:process_auto_fields(data, context, nulls, opts)
       end
     end
 
-    value = adjust_field_for_context(field, value, context, nulls, opts)
+    local err
+    value, err = adjust_field_for_context(field, value, context, nulls, opts)
+    if err then
+      return nil, err
+    end
 
     if is_select then
       local vtype = type(value)
@@ -1733,6 +1739,13 @@ function Schema:process_auto_fields(data, context, nulls, opts)
 
               value = nil
             end
+
+          elseif prev_refs and prev_refs[key] then
+            if refs then
+              refs[key] = prev_refs[key]
+            else
+              refs = { [key] = prev_refs[key] }
+            end
           end
 
         elseif vtype == "table" and (ftype == "array" or ftype == "set") then
@@ -1740,13 +1753,22 @@ function Schema:process_auto_fields(data, context, nulls, opts)
           if subfield.type == "string" and subfield.referenceable then
             local count = #value
             if count > 0 then
-              refs[key] = new_tab(count, 0)
               for i = 1, count do
                 if is_reference(value[i]) then
+                  if not refs then
+                    refs = {}
+                  end
+
+                  if not refs[key] then
+                    refs[key] = new_tab(count, 0)
+                  end
+
                   refs[key][i] = value[i]
+
                   local deref, err = kong.vault.get(value[i])
                   if deref then
                     value[i] = deref
+
                   else
                     if err then
                       kong.log.warn("unable to resolve reference ", value[i], " (", err, ")")
@@ -1757,6 +1779,63 @@ function Schema:process_auto_fields(data, context, nulls, opts)
                     value[i] = nil
                   end
                 end
+              end
+            end
+
+            if prev_refs and prev_refs[key] then
+              if refs then
+                if not refs[key] then
+                  refs[key] = prev_refs[key]
+                end
+
+              else
+                refs = { [key] = prev_refs[key] }
+              end
+            end
+          end
+
+        elseif vtype == "table" and ftype == "map" then
+          local subfield = field.values
+          if subfield.type == "string" and subfield.referenceable then
+            local count = nkeys(value)
+            if count > 0 then
+              for k, v in pairs(value) do
+                if is_reference(v) then
+                  if not refs then
+                    refs = {}
+                  end
+
+                  if not refs[key] then
+                    refs[key] = new_tab(0, count)
+                  end
+
+                  refs[key][k] = v
+
+                  local deref, err = kong.vault.get(v)
+                  if deref then
+                    value[k] = deref
+
+                  else
+                    if err then
+                      kong.log.warn("unable to resolve reference ", v, " (", err, ")")
+                    else
+                      kong.log.warn("unable to resolve reference ", v)
+                    end
+
+                    value[k] = nil
+                  end
+                end
+              end
+            end
+
+            if prev_refs and prev_refs[key] then
+              if refs then
+                if not refs[key] then
+                  refs[key] = prev_refs[key]
+                end
+
+              else
+                refs = { [key] = prev_refs[key] }
               end
             end
           end
@@ -1782,10 +1861,7 @@ function Schema:process_auto_fields(data, context, nulls, opts)
   for key in pairs(data) do
     local field = self.fields[key]
     if field then
-      if not field.legacy
-         and field.type == "string"
-         and (field.len_min or 1) > 0
-         and data[key] == ""
+      if field.type == "string" and (field.len_min or 1) > 0 and data[key] == ""
       then
         data[key] = nulls and null or nil
       end
@@ -1824,7 +1900,7 @@ function Schema:merge_values(top, bottom)
       output[key] = bottom[key]
 
     else
-      if field.type == "record" and not field.abstract and top_v ~= null then
+      if field.type == "record" and not field.abstract and type(top_v) == "table" then
         output[key] = get_field_schema(field):merge_values(top_v, bottom[key])
       else
         output[key] = top_v
@@ -2111,27 +2187,6 @@ local function get_foreign_schema_for_field(field)
 end
 
 
---- Cycle-aware table copy.
--- To be replaced by tablex.deepcopy() when it supports cycles.
-local function copy(t, cache)
-  if type(t) ~= "table" then
-    return t
-  end
-  cache = cache or {}
-  if cache[t] then
-    return cache[t]
-  end
-  local c = {}
-  cache[t] = c
-  for k, v in pairs(t) do
-    local kk = copy(k, cache)
-    local vv = copy(v, cache)
-    c[kk] = vv
-  end
-  return c
-end
-
-
 function Schema:get_constraints()
   if self.name == "workspaces" then
     -- merge explicit and implicit constraints for workspaces
@@ -2222,9 +2277,19 @@ local function run_transformations(self, transformations, input, original_input,
     end
 
     if transform then
-      local args = get_transform_args(input, original_input, output, transformation)
-      if args then
-        local data, err = transform(unpack(args))
+      if transformation.input or transformation.needs then
+        local args = get_transform_args(input, original_input, output, transformation)
+        if args then
+          local data, err = transform(unpack(args))
+          if err then
+            return nil, validation_errors.TRANSFORMATION_ERROR:format(err)
+          end
+
+          output = self:merge_values(data, output or input)
+        end
+
+      else
+        local data, err = transform(output or input)
         if err then
           return nil, validation_errors.TRANSFORMATION_ERROR:format(err)
         end
@@ -2232,7 +2297,6 @@ local function run_transformations(self, transformations, input, original_input,
         output = self:merge_values(data, output or input)
       end
     end
-
   end
 
   return output or input
@@ -2281,7 +2345,7 @@ function Schema.new(definition, is_subschema)
     return nil, validation_errors.SCHEMA_NO_FIELDS
   end
 
-  local self = copy(definition)
+  local self = tablex.deepcopy(definition)
   setmetatable(self, Schema)
 
   local cache_key = self.cache_key
@@ -2338,6 +2402,30 @@ function Schema.new(definition, is_subschema)
     -- but always update the schema object in cache
     _cache[self.name].schema = self
   end
+
+  -- timestamp-irrelevant fields should not be a critial factor on entities to
+  -- be loaded or refreshed correctly. These fields, such as `ttl` and `updated_at`
+  -- might be ignored during validation.
+  -- unvalidated_fields is added for ignoring some fields, key in the table is the
+  -- name of the field to be ignored, the value must be a function, when the field
+  -- should be ignored, it returns true otherwise returns false.
+  self.unvalidated_fields = {
+    ["ttl"] = function ()
+      return self.ttl
+    end,
+    ["updated_at"] = function()
+      return true
+    end
+  }
+
+  setmetatable(self.unvalidated_fields, {
+    __index = function()
+      return function() -- default option
+        return false
+      end
+    end
+  })
+
 
   return self
 end

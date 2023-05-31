@@ -57,13 +57,28 @@ function _M:access(config)
 end
 
 
+function _M:header_filter(config)
+  local tracer = kong.tracing(tracer_name)
+
+  local span
+  if config.custom_spans then
+    span = tracer.start_span("header_filter")
+    tracer.set_active_span(span)
+  end
+
+  if span then
+    span:finish()
+  end
+end
+
+
 local function push_data(premature, data, config)
   if premature then
     return
   end
 
   local tcpsock = ngx.socket.tcp()
-  tcpsock:settimeout(1000)
+  tcpsock:settimeouts(10000, 10000, 10000)
   local ok, err = tcpsock:connect(config.host, config.port)
   if not ok then
     kong.log.err("connect err: ".. err)
@@ -89,6 +104,9 @@ function _M:log(config)
 
   local spans = {}
   local process_span = function (span)
+    if span.should_sample == false then
+      return
+    end
     local s = table.clone(span)
     s.tracer = nil
     s.parent = nil

@@ -2,6 +2,8 @@ local helpers = require "spec.helpers"
 local conf_loader = require "kong.conf_loader"
 local prefix_handler = require "kong.cmd.utils.prefix_handler"
 local ffi = require "ffi"
+local tablex = require "pl.tablex"
+local ssl_fixtures = require "spec.fixtures.ssl"
 
 local exists = helpers.path.exists
 local join = helpers.path.join
@@ -191,6 +193,41 @@ describe("NGINX conf compiler", function()
       local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
       assert.matches("listen%s+0%.0%.0%.0:9000 reuseport;", kong_nginx_conf)
     end)
+    it("enables ipv6only", function()
+      local conf = assert(conf_loader(helpers.test_conf_path, {
+        proxy_listen = "[::1]:9000 ipv6only=on",
+      }))
+      local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("listen%s+%[0000:0000:0000:0000:0000:0000:0000:0001%]:9000 ipv6only=on;", kong_nginx_conf)
+    end)
+    it("disables ipv6only", function()
+      local conf = assert(conf_loader(helpers.test_conf_path, {
+        proxy_listen = "0.0.0.0:9000 ipv6only=off",
+      }))
+      local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("listen%s+0%.0%.0%.0:9000 ipv6only=off;", kong_nginx_conf)
+    end)
+    it("enables so_keepalive", function()
+      local conf = assert(conf_loader(helpers.test_conf_path, {
+        proxy_listen = "0.0.0.0:9000 so_keepalive=on",
+      }))
+      local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("listen%s+0%.0%.0%.0:9000 so_keepalive=on;", kong_nginx_conf)
+    end)
+    it("disables so_keepalive", function()
+      local conf = assert(conf_loader(helpers.test_conf_path, {
+        proxy_listen = "0.0.0.0:9000 so_keepalive=off",
+      }))
+      local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("listen%s+0%.0%.0%.0:9000 so_keepalive=off;", kong_nginx_conf)
+    end)
+    it("configures so_keepalive", function()
+      local conf = assert(conf_loader(helpers.test_conf_path, {
+        proxy_listen = "0.0.0.0:9000 so_keepalive=30m::10",
+      }))
+      local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("listen%s+0%.0%.0%.0:9000 so_keepalive=30m::10;", kong_nginx_conf)
+    end)
     it("disables SSL", function()
       local conf = assert(conf_loader(helpers.test_conf_path, {
         proxy_listen = "127.0.0.1:8000",
@@ -281,20 +318,6 @@ describe("NGINX conf compiler", function()
       }))
       local nginx_conf = prefix_handler.compile_kong_conf(conf)
       assert.matches("client_body_buffer_size%s+50m", nginx_conf)
-    end)
-    it("writes kong_cassandra shm if using Cassandra", function()
-      local conf = assert(conf_loader(nil, {
-        database = "cassandra",
-      }))
-      local nginx_conf = prefix_handler.compile_kong_conf(conf)
-      assert.matches("lua_shared_dict%s+kong_cassandra", nginx_conf)
-    end)
-    it("does not write kong_cassandra shm if not using Cassandra", function()
-      local conf = assert(conf_loader(nil, {
-        database = "postgres",
-      }))
-      local nginx_conf = prefix_handler.compile_kong_conf(conf)
-      assert.not_matches("lua_shared_dict%s+kong_cassandra", nginx_conf)
     end)
 
     describe("user directive", function()
@@ -718,6 +741,7 @@ describe("NGINX conf compiler", function()
 
       local ulimit = prefix_handler.get_ulimit()
       ulimit = math.min(ulimit, 16384)
+      ulimit = math.max(ulimit, 1024)
 
       local nginx_conf = prefix_handler.compile_nginx_conf(conf)
       assert.matches("worker_rlimit_nofile%s+" .. ulimit .. ";", nginx_conf)
@@ -725,11 +749,11 @@ describe("NGINX conf compiler", function()
     end)
     it("converts dns_resolver to string", function()
       local nginx_conf = prefix_handler.compile_nginx_conf({
-        dns_resolver = { "8.8.8.8", "8.8.4.4" }
+        dns_resolver = { "1.2.3.4", "5.6.7.8" }
       }, [[
         "resolver ${{DNS_RESOLVER}} ipv6=off;"
       ]])
-      assert.matches("resolver%s+8%.8%.8%.8 8%.8%.4%.4 ipv6=off;", nginx_conf)
+      assert.matches("resolver%s+1%.2%.3%.4 5%.6%.7%.8 ipv6=off;", nginx_conf)
     end)
   end)
 
@@ -928,6 +952,83 @@ describe("NGINX conf compiler", function()
         assert.truthy(exists(join(conf.prefix, "ssl", conf.ssl_dhparam .. ".pem")))
         assert.truthy(exists(join(conf.prefix, "ssl", conf.nginx_http_ssl_dhparam .. ".pem")))
         assert.truthy(exists(join(conf.prefix, "ssl", conf.nginx_stream_ssl_dhparam .. ".pem")))
+      end)
+      describe("accept raw content for configuration properties", function()
+        it("writes files and re-configures valid paths", function()
+          local cert = ssl_fixtures.cert
+          local cacert = ssl_fixtures.cert_ca
+          local key = ssl_fixtures.key
+          local dhparam = ssl_fixtures.dhparam
+
+          local params = {
+            ssl_cipher_suite = "old",
+            prefix = tmp_config.prefix,
+          }
+          local ssl_params = {
+            ssl_cert = cert,
+            ssl_cert_key = key,
+            admin_ssl_cert = cert,
+            admin_ssl_cert_key = key,
+            status_ssl_cert = cert,
+            status_ssl_cert_key = key,
+            client_ssl_cert = cert,
+            client_ssl_cert_key = key,
+            cluster_cert = cert,
+            cluster_cert_key = key,
+            cluster_ca_cert = cacert,
+            ssl_dhparam = dhparam,
+            lua_ssl_trusted_certificate = cacert
+          }
+
+          local conf, err = conf_loader(nil, tablex.merge(params, ssl_params, true))
+          assert(prefix_handler.prepare_prefix(conf))
+          assert.is_nil(err)
+          assert.is_table(conf)
+
+          for name, input_content in pairs(ssl_params) do
+            local paths = conf[name]
+            if type(paths) == "table" then
+              for i = 1, #paths do
+                assert.truthy(exists(paths[i]))
+                local configured_content = assert(helpers.file.read(paths[i]))
+                assert.equals(input_content, configured_content)
+              end
+            end
+
+            if type(paths) == "string" then
+              assert.truthy(exists(paths))
+              local configured_content = assert(helpers.file.read(paths))
+              assert.equals(input_content, configured_content)
+            end
+          end
+        end)
+        it("sets lua_ssl_trusted_certificate to a combined file" ..
+           "(multiple content entries)", function()
+          local cacerts = string.format(
+            "%s,%s",
+            ssl_fixtures.cert_ca,
+            ssl_fixtures.cert_ca
+          )
+          local conf = assert(conf_loader(nil, {
+            lua_ssl_trusted_certificate = cacerts,
+            prefix = tmp_config.prefix
+          }))
+          assert(prefix_handler.prepare_prefix(conf))
+          assert.is_table(conf)
+          local trusted_certificates = conf["lua_ssl_trusted_certificate"]
+          assert.equal(2, #trusted_certificates)
+          local combined = assert(
+            helpers.file.read(conf["lua_ssl_trusted_certificate_combined"])
+          )
+          assert.equal(
+            combined,
+            string.format(
+              "%s\n%s\n",
+              ssl_fixtures.cert_ca,
+              ssl_fixtures.cert_ca
+            )
+          )
+        end)
       end)
     end)
 

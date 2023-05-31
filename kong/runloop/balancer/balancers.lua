@@ -102,6 +102,7 @@ local function create_balancer_exclusive(upstream)
   local health_threshold = upstream.healthchecks and
     upstream.healthchecks.threshold or nil
 
+  targets.clean_targets_cache(upstream)
   local targets_list, err = targets.fetch_targets(upstream)
   if not targets_list then
     return nil, "failed fetching targets:" .. err
@@ -112,6 +113,7 @@ local function create_balancer_exclusive(upstream)
       ["consistent-hashing"] = require("kong.runloop.balancer.consistent_hashing"),
       ["least-connections"] = require("kong.runloop.balancer.least_connections"),
       ["round-robin"] = require("kong.runloop.balancer.round_robin"),
+      ["latency"] = require("kong.runloop.balancer.latency"),
     }
   end
 
@@ -130,7 +132,7 @@ local function create_balancer_exclusive(upstream)
     ttl0Interval = opts.ttl0 or TTL_0_RETRY, -- refreshing ttl=0 records
     healthy = false, -- initial healthstatus of the balancer
     healthThreshold = health_threshold or 0, -- % healthy weight for overall balancer health
-    useSRVname = not not opts.useSRVname, -- force to boolean
+    useSRVname = upstream.use_srv_name,
   }, balancer_mt)
 
   for _, target in ipairs(targets_list) do
@@ -569,6 +571,18 @@ function balancer_mt:getPeer(...)
   end
 
   return self.algorithm:getPeer(...)
+end
+
+function balancer_mt:afterBalance(...)
+  if not self.healthy then
+    return nil, "Balancer is unhealthy"
+  end
+
+  if not self.algorithm or not self.algorithm.afterBalance then
+    return
+  end
+
+  return self.algorithm:afterBalance(...)
 end
 
 return balancers_M

@@ -2,6 +2,8 @@
 
 local aws_v4 = require "kong.plugins.aws-lambda.v4"
 local aws_serializer = require "kong.plugins.aws-lambda.aws-serializer"
+local aws_ecs_cred_provider = require "kong.plugins.aws-lambda.iam-ecs-credentials"
+local aws_ec2_cred_provider = require "kong.plugins.aws-lambda.iam-ec2-credentials"
 local http = require "resty.http"
 local cjson = require "cjson.safe"
 local meta = require "kong.meta"
@@ -21,9 +23,9 @@ end
 local function fetch_aws_credentials(aws_conf)
   local fetch_metadata_credentials do
     local metadata_credentials_source = {
-      require "kong.plugins.aws-lambda.iam-ecs-credentials",
+      aws_ecs_cred_provider,
       -- The EC2 one will always return `configured == true`, so must be the last!
-      require "kong.plugins.aws-lambda.iam-ec2-credentials",
+      aws_ec2_cred_provider,
     }
 
     for _, credential_source in ipairs(metadata_credentials_source) do
@@ -35,7 +37,7 @@ local function fetch_aws_credentials(aws_conf)
   end
 
   if aws_conf.aws_assume_role_arn then
-    local metadata_credentials, err = fetch_metadata_credentials()
+    local metadata_credentials, err = fetch_metadata_credentials(aws_conf)
 
     if err then
       return nil, err
@@ -50,7 +52,7 @@ local function fetch_aws_credentials(aws_conf)
                                                              metadata_credentials.session_token)
 
   else
-    return fetch_metadata_credentials()
+    return fetch_metadata_credentials(aws_conf)
   end
 end
 
@@ -143,9 +145,12 @@ local function extract_proxy_response(content)
 
   local headers = serialized_content.headers or {}
   local body = serialized_content.body or ""
-  local isBase64Encoded = serialized_content.isBase64Encoded or false
-  if isBase64Encoded then
+  local isBase64Encoded = serialized_content.isBase64Encoded
+  if isBase64Encoded == true then
     body = ngx_decode_base64(body)
+
+  elseif isBase64Encoded ~= false and isBase64Encoded ~= nil then
+    return nil, "isBase64Encoded must be a boolean"
   end
 
   local multiValueHeaders = serialized_content.multiValueHeaders
@@ -238,6 +243,8 @@ function AWSLambdaHandler:access(conf)
   local path = fmt("/2015-03-31/functions/%s/invocations", conf.function_name)
   local port = conf.port or AWS_PORT
 
+  local scheme = conf.disable_https and "http" or "https"
+
   local opts = {
     region = region,
     service = "lambda",
@@ -253,6 +260,7 @@ function AWSLambdaHandler:access(conf)
     path = path,
     host = host,
     port = port,
+    tls = not conf.disable_https,
     query = conf.qualifier and "Qualifier=" .. conf.qualifier
   }
 
@@ -260,6 +268,7 @@ function AWSLambdaHandler:access(conf)
     aws_region = conf.aws_region,
     aws_assume_role_arn = conf.aws_assume_role_arn,
     aws_role_session_name = conf.aws_role_session_name,
+    aws_imds_protocol_version = conf.aws_imds_protocol_version,
   }
 
   if not conf.aws_key then
@@ -273,7 +282,7 @@ function AWSLambdaHandler:access(conf)
     )
 
     if not iam_role_credentials then
-      return kong.response.error(500)
+      return kong.response.error(500, "Credentials not found")
     end
 
     opts.access_key = iam_role_credentials.access_key
@@ -291,15 +300,12 @@ function AWSLambdaHandler:access(conf)
     return error(err)
   end
 
-  local uri = port and fmt("https://%s:%d", host, port)
-                    or fmt("https://%s", host)
+  local uri = port and fmt("%s://%s:%d", scheme, host, port)
+                    or fmt("%s://%s", scheme, host)
 
   local proxy_opts
   if conf.proxy_url then
-    -- lua-resty-http uses the request scheme to determine which of
-    -- http_proxy/https_proxy it will use, and from this plugin's POV, the
-    -- request scheme is always https
-    proxy_opts = { https_proxy = conf.proxy_url }
+    proxy_opts = { http_proxy = conf.proxy_url, https_proxy = conf.proxy_url }
   end
 
   -- Trigger request

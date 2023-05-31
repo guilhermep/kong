@@ -56,8 +56,6 @@ for _, strategy in helpers.each_strategy() do
       -- insert single fixture Service
       service_fixture = bp.services:insert()
 
-      local db_update_propagation = strategy == "cassandra" and 0.1 or 0
-
       assert(helpers.start_kong {
         log_level             = "debug",
         prefix                = "servroot1",
@@ -65,7 +63,6 @@ for _, strategy in helpers.each_strategy() do
         proxy_listen          = "0.0.0.0:8000, 0.0.0.0:8443 ssl",
         admin_listen          = "0.0.0.0:8001",
         db_update_frequency   = POLL_INTERVAL,
-        db_update_propagation = db_update_propagation,
         nginx_conf            = "spec/fixtures/custom_nginx.template",
       })
 
@@ -76,7 +73,6 @@ for _, strategy in helpers.each_strategy() do
         proxy_listen          = "0.0.0.0:9000, 0.0.0.0:9443 ssl",
         admin_listen          = "0.0.0.0:9001",
         db_update_frequency   = POLL_INTERVAL,
-        db_update_propagation = db_update_propagation,
       })
 
       admin_client_1 = helpers.http_client("127.0.0.1", 8001)
@@ -154,23 +150,22 @@ for _, strategy in helpers.each_strategy() do
         local json = cjson.decode(body)
         route_fixture_id = json.id
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
-        do
-          helpers.wait_until(function()
-            local res = assert(proxy_client_1:send {
-              method  = "GET",
-              path    = "/status/200",
-              headers = {
-                host = "example.com",
-              }
-            })
-            return pcall(function()
-              assert.res_status(200, res)
-            end)
-          end, 10)
-        end
+        local res = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            host = "example.com",
+          }
+        })
+        assert.res_status(200, res)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -196,23 +191,24 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(200, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
         -- TEST: ensure new host value maps to our Service
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/",
-            headers = {
-              host = "updated-example.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(200, res_1)
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/",
+          headers = {
+            host = "updated-example.com",
+          }
+        })
+        assert.res_status(200, res_1)
 
         -- TEST: ensure old host value does not map anywhere
 
@@ -253,21 +249,22 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(204, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/",
-            headers = {
-              host = "updated-example.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(404, res_1)
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/",
+          headers = {
+            host = "updated-example.com",
+          }
+        })
+        assert.res_status(404, res_1)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -303,20 +300,21 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(201, admin_res)
 
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
         -- populate cache on both nodes
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/status/200",
-            headers = {
-              host = "service.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(200, res_1)
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            host = "service.com",
+          }
+        })
+        assert.res_status(200, res_1)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -340,21 +338,22 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(200, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/",
-            headers = {
-              host = "service.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(418, res_1)
-          end)
-        end, 10)
+        res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/",
+          headers = {
+            host = "service.com",
+          }
+        })
+        assert.res_status(418, res_1)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -376,7 +375,12 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(204, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
         local res_1 = assert(proxy_client_1:send {
@@ -449,24 +453,20 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(201, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
-        -- because our test instance only has 1 worker
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
 
-        helpers.wait_until(function()
-          local cert_1 = get_cert(8443, "ssl-example.com")
-          return pcall(function()
-            assert.certificate(cert_1).has.cn("ssl-example.com")
-          end)
-        end)
+        -- no need to wait for workers propagation (lua-resty-events)
+        -- because our test instance only has 1 worker
 
         local cert_1 = get_cert(8443, "ssl-example.com")
         assert.certificate(cert_1).has.cn("ssl-example.com")
 
-        helpers.wait_until(function()
+        helpers.pwait_until(function()
           local cert_2 = get_cert(9443, "ssl-example.com")
-          return pcall(function()
-            assert.certificate(cert_2).has.cn("ssl-example.com")
-          end)
+          assert.certificate(cert_2).has.cn("ssl-example.com")
         end)
       end)
 
@@ -490,7 +490,12 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(201, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
         local cert_1a = get_cert(8443, "ssl-example.com")
@@ -499,11 +504,9 @@ for _, strategy in helpers.each_strategy() do
         local cert_1b = get_cert(8443, "new-ssl-example.com")
         assert.certificate(cert_1b).has.cn("ssl-example.com")
 
-        helpers.wait_until(function()
+        helpers.pwait_until(function()
           local cert_2a = get_cert(9443, "ssl-example.com")
-          return pcall(function()
-            assert.certificate(cert_2a).has.cn("localhost")
-          end)
+          assert.certificate(cert_2a).has.cn("localhost")
         end)
 
         local cert_2b = get_cert(9443, "new-ssl-example.com")
@@ -527,23 +530,24 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(200, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
-        -- because our test instance only has 1 worker
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
 
-        ngx.sleep(0.01)   -- wait events sync
+        -- no need to wait for workers propagation (lua-resty-events)
+        -- because our test instance only has 1 worker
 
         local cert_1 = get_cert(8443, "new-ssl-example.com")
         assert.certificate(cert_1).has.cn("ssl-alt.com")
 
-        helpers.wait_until(function()
+        helpers.pwait_until(function()
           local cert_2 = get_cert(9443, "new-ssl-example.com")
-          return pcall(function()
-            assert.certificate(cert_2).has.cn("ssl-alt.com")
-          end)
+          assert.certificate(cert_2).has.cn("ssl-alt.com")
         end)
       end)
 
-      it("on sni update via id #flaky", function()
+      it("on sni update via id", function()
         local admin_res = admin_client_1:get("/snis")
         local body = assert.res_status(200, admin_res)
         local sni = assert(cjson.decode(body).data[1])
@@ -554,29 +558,37 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(200, admin_res)
 
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
         local cert_1_old = get_cert(8443, "new-ssl-example.com")
         assert.certificate(cert_1_old).has.cn("localhost")
 
         local cert_1_new = get_cert(8443, "updated-sn-via-id.com")
         assert.certificate(cert_1_new).has.cn("ssl-alt.com")
 
-        helpers.wait_until(function()
+        helpers.pwait_until(function()
           local cert_2_old = get_cert(9443, "new-ssl-example.com")
-          return pcall(function()
-            assert.certificate(cert_2_old).has.cn("localhost")
-          end)
+          assert.certificate(cert_2_old).has.cn("localhost")
         end)
 
         local cert_2_new = get_cert(9443, "updated-sn-via-id.com")
         assert.certificate(cert_2_new).has.cn("ssl-alt.com")
       end)
 
-      it("on sni update via name #flaky", function()
+      it("on sni update via name", function()
         local admin_res = admin_client_1:patch("/snis/updated-sn-via-id.com", {
           body    = { name = "updated-sn.com" },
           headers = { ["Content-Type"] = "application/json" },
         })
         assert.res_status(200, admin_res)
+
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
 
         local cert_1_old = get_cert(8443, "updated-sn-via-id.com")
         assert.certificate(cert_1_old).has.cn("localhost")
@@ -584,34 +596,35 @@ for _, strategy in helpers.each_strategy() do
         local cert_1_new = get_cert(8443, "updated-sn.com")
         assert.certificate(cert_1_new).has.cn("ssl-alt.com")
 
-        helpers.wait_until(function()
+        helpers.pwait_until(function()
           local cert_2_old = get_cert(9443, "updated-sn-via-id.com")
-          return pcall(function()
-            assert.certificate(cert_2_old).has.cn("localhost")
-          end)
+          assert.certificate(cert_2_old).has.cn("localhost")
         end)
 
         local cert_2_new = get_cert(9443, "updated-sn.com")
         assert.certificate(cert_2_new).has.cn("ssl-alt.com")
       end)
 
-      it("on certificate delete #flaky", function()
+      it("on certificate delete", function()
         -- delete our certificate
 
         local admin_res = admin_client_1:delete("/certificates/updated-sn.com")
         assert.res_status(204, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
         local cert_1 = get_cert(8443, "updated-sn.com")
         assert.certificate(cert_1).has.cn("localhost")
 
-        helpers.wait_until(function()
+        helpers.pwait_until(function()
           local cert_2 = get_cert(9443, "updated-sn.com")
-          return pcall(function()
-            assert.certificate(cert_2).has.cn("localhost")
-          end)
+          assert.certificate(cert_2).has.cn("localhost")
         end)
       end)
 
@@ -637,7 +650,12 @@ for _, strategy in helpers.each_strategy() do
           })
           assert.res_status(201, admin_res)
 
-          -- no need to wait for workers propagation (lua-resty-worker-events)
+          helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+          -- no need to wait for workers propagation (lua-resty-events)
           -- because our test instance only has 1 worker
 
           local cert = get_cert(8443, "test.wildcard.com")
@@ -645,18 +663,14 @@ for _, strategy in helpers.each_strategy() do
           cert = get_cert(8443, "test2.wildcard.com")
           assert.certificate(cert).has.cn("ssl-alt.com")
 
-          helpers.wait_until(function()
+          helpers.pwait_until(function()
             cert = get_cert(9443, "test.wildcard.com")
-            return pcall(function()
-              assert.certificate(cert).has.cn("ssl-alt.com")
-            end)
+            assert.certificate(cert).has.cn("ssl-alt.com")
           end)
 
-          helpers.wait_until(function()
+          helpers.pwait_until(function()
             cert = get_cert(9443, "test2.wildcard.com")
-            return pcall(function()
-              assert.certificate(cert).has.cn("ssl-alt.com")
-            end)
+            assert.certificate(cert).has.cn("ssl-alt.com")
           end)
 
           cert = get_cert(8443, "wildcard.org")
@@ -682,14 +696,17 @@ for _, strategy in helpers.each_strategy() do
           })
           assert.res_status(200, admin_res)
 
-          -- no need to wait for workers propagation (lua-resty-worker-events)
+          helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+          -- no need to wait for workers propagation (lua-resty-events)
           -- because our test instance only has 1 worker
 
-          helpers.wait_until(function()
+          helpers.pwait_until(function()
             local cert = get_cert(8443, "test.wildcard.com")
-            return pcall(function()
-              assert.certificate(cert).has.cn("ssl-alt-alt.com")
-            end)
+            assert.certificate(cert).has.cn("ssl-alt-alt.com")
           end)
 
           local cert = get_cert(8443, "test.wildcard.com")
@@ -697,13 +714,11 @@ for _, strategy in helpers.each_strategy() do
           cert = get_cert(8443, "test2.wildcard.com")
           assert.certificate(cert).has.cn("ssl-alt-alt.com")
 
-          helpers.wait_until(function()
+          helpers.pwait_until(function()
             local cert1 = get_cert(9443, "test.wildcard.com")
             local cert2 = get_cert(9443, "test2.wildcard.com")
-            return pcall(function()
-              assert.certificate(cert1).has.cn("ssl-alt-alt.com")
-              assert.certificate(cert2).has.cn("ssl-alt-alt.com")
-            end)
+            assert.certificate(cert1).has.cn("ssl-alt-alt.com")
+            assert.certificate(cert2).has.cn("ssl-alt-alt.com")
           end)
         end)
 
@@ -718,6 +733,11 @@ for _, strategy in helpers.each_strategy() do
           })
           assert.res_status(200, admin_res)
 
+          helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
           local cert_1_old = get_cert(8443, "test.wildcard.com")
           assert.certificate(cert_1_old).has.cn("localhost")
           cert_1_old = get_cert(8443, "test2.wildcard.com")
@@ -728,13 +748,11 @@ for _, strategy in helpers.each_strategy() do
           cert_1_new = get_cert(8443, "test2.wildcard_updated.com")
           assert.certificate(cert_1_new).has.cn("ssl-alt-alt.com")
 
-          helpers.wait_until(function()
+          helpers.pwait_until(function()
             local cert_2_old_1 = get_cert(9443, "test.wildcard.com")
             local cert_2_old_2 = get_cert(9443, "test2.wildcard.com")
-            return pcall(function()
-              assert.certificate(cert_2_old_1).has.cn("localhost")
-              assert.certificate(cert_2_old_2).has.cn("localhost")
-            end)
+            assert.certificate(cert_2_old_1).has.cn("localhost")
+            assert.certificate(cert_2_old_2).has.cn("localhost")
           end)
 
           local cert_2_new = get_cert(9443, "test.wildcard_updated.com")
@@ -750,6 +768,11 @@ for _, strategy in helpers.each_strategy() do
           })
           assert.res_status(200, admin_res)
 
+          helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
           local cert_1_old = get_cert(8443, "test.wildcard_updated.com")
           assert.certificate(cert_1_old).has.cn("localhost")
           cert_1_old = get_cert(8443, "test2.wildcard_updated.com")
@@ -760,13 +783,11 @@ for _, strategy in helpers.each_strategy() do
           cert_1_new = get_cert(8443, "test2.wildcard.org")
           assert.certificate(cert_1_new).has.cn("ssl-alt-alt.com")
 
-          helpers.wait_until(function()
+          helpers.pwait_until(function()
             local cert_2_old_1 = get_cert(9443, "test.wildcard_updated.com")
             local cert_2_old_2 = get_cert(9443, "test2.wildcard_updated.com")
-            return pcall(function()
-              assert.certificate(cert_2_old_1).has.cn("localhost")
-              assert.certificate(cert_2_old_2).has.cn("localhost")
-            end)
+            assert.certificate(cert_2_old_1).has.cn("localhost")
+            assert.certificate(cert_2_old_2).has.cn("localhost")
           end)
 
           local cert_2_new = get_cert(9443, "test.wildcard.org")
@@ -781,7 +802,12 @@ for _, strategy in helpers.each_strategy() do
           local admin_res = admin_client_1:delete("/certificates/%2A.wildcard.org")
           assert.res_status(204, admin_res)
 
-          -- no need to wait for workers propagation (lua-resty-worker-events)
+          helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+          -- no need to wait for workers propagation (lua-resty-events)
           -- because our test instance only has 1 worker
 
           local cert_1 = get_cert(8443, "test.wildcard.org")
@@ -789,14 +815,12 @@ for _, strategy in helpers.each_strategy() do
           cert_1 = get_cert(8443, "test2.wildcard.org")
           assert.certificate(cert_1).has.cn("localhost")
 
-          helpers.wait_until(function()
+          helpers.pwait_until(function()
             local cert_2_1 = get_cert(9443, "test.wildcard.org")
             local cert_2_2 = get_cert(9443, "test2.wildcard.org")
-            return pcall(function()
-              assert.certificate(cert_2_1).has.cn("localhost")
-              assert.certificate(cert_2_2).has.cn("localhost")
-            end)
-          end)
+            assert.certificate(cert_2_1).has.cn("localhost")
+            assert.certificate(cert_2_2).has.cn("localhost")
+          end) -- helpers.pwait_until(function()
         end)
       end)
     end)
@@ -844,25 +868,25 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(201, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
         -- populate cache with a miss on
         -- both nodes
 
-        local res_1
-        helpers.wait_until(function()
-          res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/status/200",
-            headers = {
-              host = "dummy.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(200, res_1)
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            host = "dummy.com",
+          }
+        })
+        assert.res_status(200, res_1)
 
         assert.is_nil(res_1.headers["Dummy-Plugin"])
 
@@ -899,22 +923,23 @@ for _, strategy in helpers.each_strategy() do
         local plugin = cjson.decode(body)
         service_plugin_id = assert(plugin.id, "could not get plugin id from " .. body)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/status/200",
-            headers = {
-              host = "dummy.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(200, res_1)
-            assert.equal("1", res_1.headers["Dummy-Plugin"])
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            host = "dummy.com",
+          }
+        })
+        assert.res_status(200, res_1)
+        assert.equal("1", res_1.headers["Dummy-Plugin"])
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -940,22 +965,23 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(200, admin_res_plugin)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/status/200",
-            headers = {
-              host = "dummy.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(200, res_1)
-            assert.equal("2", res_1.headers["Dummy-Plugin"])
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            host = "dummy.com",
+          }
+        })
+        assert.res_status(200, res_1)
+        assert.equal("2", res_1.headers["Dummy-Plugin"])
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -973,22 +999,23 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(204, admin_res_plugin)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/status/200",
-            headers = {
-              host = "dummy.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(200, res_1)
-            assert.is_nil(res_1.headers["Dummy-Plugin"])
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            host = "dummy.com",
+          }
+        })
+        assert.res_status(200, res_1)
+        assert.is_nil(res_1.headers["Dummy-Plugin"])
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -1044,22 +1071,23 @@ for _, strategy in helpers.each_strategy() do
         local plugin = cjson.decode(body)
         global_dummy_plugin_id = assert(plugin.id)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/status/200",
-            headers = {
-              host = "dummy.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(200, res_1)
-            assert.equal("1", res_1.headers["Dummy-Plugin"])
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            host = "dummy.com",
+          }
+        })
+        assert.res_status(200, res_1)
+        assert.equal("1", res_1.headers["Dummy-Plugin"])
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -1087,22 +1115,23 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(204, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/status/200",
-            headers = {
-              host = "dummy.com",
-            }
-          })
-          return pcall(function()
-            assert.res_status(200, res_1)
-            assert.is_nil(res_1.headers["Dummy-Plugin"])
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            host = "dummy.com",
+          }
+        })
+        assert.res_status(200, res_1)
+        assert.is_nil(res_1.headers["Dummy-Plugin"])
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -1139,8 +1168,6 @@ for _, strategy in helpers.each_strategy() do
       -- insert single fixture Service
       service_fixture = bp.services:insert()
 
-      local db_update_propagation = strategy == "cassandra" and 0.1 or 0
-
       assert(helpers.start_kong {
         log_level             = "debug",
         prefix                = "servroot1",
@@ -1148,7 +1175,6 @@ for _, strategy in helpers.each_strategy() do
         proxy_listen          = "0.0.0.0:8000, 0.0.0.0:8443 ssl",
         admin_listen          = "0.0.0.0:8001",
         db_update_frequency   = POLL_INTERVAL,
-        db_update_propagation = db_update_propagation,
         nginx_conf            = "spec/fixtures/custom_nginx.template",
         declarative_config    = "ignore-me.yml",
       })
@@ -1160,7 +1186,6 @@ for _, strategy in helpers.each_strategy() do
         proxy_listen          = "0.0.0.0:9000, 0.0.0.0:9443 ssl",
         admin_listen          = "0.0.0.0:9001",
         db_update_frequency   = POLL_INTERVAL,
-        db_update_propagation = db_update_propagation,
         declarative_config    = "ignore-me.yml",
       })
 
@@ -1230,21 +1255,22 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(201, admin_res)
 
-        -- no need to wait for workers propagation (lua-resty-worker-events)
+        helpers.wait_for_all_config_update({
+          forced_admin_port = 8001,
+          forced_proxy_port = 8000,
+        })
+
+        -- no need to wait for workers propagation (lua-resty-events)
         -- because our test instance only has 1 worker
 
-        helpers.wait_until(function()
-          local res_1 = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/status/200",
-            headers = {
-              host = "propagation.test",
-            }
-          })
-          return pcall(function()
-            assert.res_status(200, res_1)
-          end)
-        end, 10)
+        local res_1 = assert(proxy_client_1:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            host = "propagation.test",
+          }
+        })
+        assert.res_status(200, res_1)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -1262,8 +1288,6 @@ for _, strategy in helpers.each_strategy() do
 
     local proxy_client_1
     local proxy_client_2
-
-    local wait_for_propagation
 
     local service
     local service_cache_key
@@ -1290,8 +1314,6 @@ for _, strategy in helpers.each_strategy() do
         service = { id = service.id },
       }
 
-      local db_update_propagation = strategy == "cassandra" and 0.1 or 0
-
       assert(helpers.start_kong {
         log_level             = "debug",
         prefix                = "servroot1",
@@ -1300,7 +1322,6 @@ for _, strategy in helpers.each_strategy() do
         proxy_listen          = "0.0.0.0:8000, 0.0.0.0:8443 ssl",
         admin_listen          = "0.0.0.0:8001",
         db_update_frequency   = POLL_INTERVAL,
-        db_update_propagation = db_update_propagation,
         nginx_conf            = "spec/fixtures/custom_nginx.template",
       })
 
@@ -1312,12 +1333,7 @@ for _, strategy in helpers.each_strategy() do
         proxy_listen          = "0.0.0.0:9000, 0.0.0.0:9443 ssl",
         admin_listen          = "off",
         db_update_frequency   = POLL_INTERVAL,
-        db_update_propagation = db_update_propagation,
       })
-
-      wait_for_propagation = function()
-        ngx.sleep(POLL_INTERVAL * 2 + db_update_propagation * 2)
-      end
     end)
 
     lazy_teardown(function()
@@ -1343,7 +1359,7 @@ for _, strategy in helpers.each_strategy() do
     -----------
 
     describe("Services", function()
-      it("#flaky raises correct number of invalidation events", function()
+      it("raises correct number of invalidation events", function()
         local admin_res = assert(admin_client:send {
           method = "PATCH",
           path   = "/services/" .. service.id,
@@ -1356,19 +1372,23 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(200, admin_res)
 
-        wait_for_propagation()
+        --[[
+          we can't use `helpers.wait_for_all_config_update()` here
+          because the testing plugin `invalidations` always returns 200.
+        --]]
+        helpers.pwait_until(function ()
+          local proxy_res = assert(proxy_client_1:get("/"))
+          local body = assert.res_status(200, proxy_res)
+          local json = cjson.decode(body)
 
-        local proxy_res = assert(proxy_client_1:get("/"))
-        local body = assert.res_status(200, proxy_res)
-        local json = cjson.decode(body)
+          assert.equal(nil, json[service_cache_key])
 
-        assert.equal(nil, json[service_cache_key])
+          local proxy_res = assert(proxy_client_2:get("/"))
+          local body = assert.res_status(200, proxy_res)
+          local json = cjson.decode(body)
 
-        local proxy_res = assert(proxy_client_2:get("/"))
-        local body = assert.res_status(200, proxy_res)
-        local json = cjson.decode(body)
-
-        assert.equal(1, json[service_cache_key])
+          assert.equal(1, json[service_cache_key])
+        end)
       end)
     end)
   end)

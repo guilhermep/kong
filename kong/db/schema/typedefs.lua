@@ -1,6 +1,7 @@
 --- A library of ready-to-use type synonyms to use in schema definitions.
 -- @module kong.db.schema.typedefs
 local utils = require "kong.tools.utils"
+local queue_schema = require "kong.tools.queue_schema"
 local openssl_pkey = require "resty.openssl.pkey"
 local openssl_x509 = require "resty.openssl.x509"
 local Schema = require "kong.db.schema"
@@ -8,6 +9,8 @@ local socket_url = require "socket.url"
 local constants = require "kong.constants"
 
 
+local DAO_MAX_TTL = constants.DATABASE.DAO_MAX_TTL
+local normalize = require("kong.tools.uri").normalize
 local pairs = pairs
 local match = string.match
 local gsub = string.gsub
@@ -118,7 +121,7 @@ local function validate_tag(tag)
 
   -- printable ASCII (33-126 except ','(44) and '/'(47),
   -- plus non-ASCII utf8 (128-244)
-  if not match(tag, "^[\033-\043\045\046\048-\126\128-\244]+$") then
+  if not match(tag, "^[ \033-\043\045\046\048-\126\128-\244]+$") then
     return nil,
     "invalid tag '" .. tag ..
       "': expected printable ascii (except `,` and `/`) or valid utf-8 sequences"
@@ -151,7 +154,7 @@ local function validate_sni(host)
     return nil, "invalid value: " .. host
   end
 
-  if res.type ~= "name" then
+  if res and res.type ~= "name" then
     return nil, "must not be an IP"
   end
 
@@ -184,7 +187,7 @@ local function validate_wildcard_host(host)
     return nil, "invalid value: " .. host
   end
 
-  if res.type ~= "name" then
+  if res and res.type ~= "name" then
     return nil, "must not be an IP"
   end
 
@@ -303,6 +306,7 @@ typedefs.path = Schema.define {
   },
   custom_validator = validate_path,
 }
+
 
 typedefs.url = Schema.define {
   type = "string",
@@ -446,15 +450,18 @@ local function validate_path_with_regexes(path)
     return ok, err, err_code
   end
 
-  -- We can't take an ok from validate_path as a success just yet,
-  -- because the router is currently more strict than RFC 3986 for
-  -- non-regex paths:
-  if ngx.re.find(path, [[^[a-zA-Z0-9\.\-_~/%]*$]]) then
+  if path:sub(1, 1) ~= "~" then
+    -- prefix matching. let's check if it's normalized form
+    local normalized = normalize(path, true)
+    if path ~= normalized then
+      return nil, "non-normalized path, consider use '" .. normalized .. "' instead"
+    end
+
     return true
   end
 
-  -- URI contains characters outside of the list recognized by the
-  -- router as valid non-regex paths.
+  path = path:sub(2)
+
   -- the value will be interpreted as a regex by the router; but is it a
   -- valid one? Let's dry-run it with the same options as our router.
   local _, _, err = ngx.re.find("", path, "aj")
@@ -527,20 +534,26 @@ typedefs.hosts = Schema.define {
 
 typedefs.no_hosts = Schema.define(typedefs.hosts { eq = null })
 
-typedefs.paths = Schema.define {
-  type = "array",
-  elements = typedefs.path {
-    custom_validator = validate_path_with_regexes,
-    match_none = {
-      {
-        pattern = "//",
-        err = "must not have empty segments"
-      },
+typedefs.router_path = Schema.define {
+  type = "string",
+  match_any = {
+    patterns = {"^/", "^~/"},
+    err = "should start with: / (fixed path) or ~/ (regex path)",
+  },
+  match_none = {
+    { pattern = "//",
+      err = "must not have empty segments"
     },
-  }
+  },
+  custom_validator = validate_path_with_regexes,
 }
 
-typedefs.no_paths = Schema.define(typedefs.paths { eq = null })
+typedefs.router_paths = Schema.define {
+  type = "array",
+  elements = typedefs.router_path
+}
+
+typedefs.no_paths = Schema.define(typedefs.router_paths { eq = null })
 
 typedefs.headers = Schema.define {
   type = "map",
@@ -569,6 +582,232 @@ typedefs.semantic_version = Schema.define {
   },
 }
 
+local function validate_jwk(key)
+  -- unless it's a reference
+  if kong.vault.is_reference(key) then
+    return true
+  end
+
+  local pk, err = openssl_pkey.new(key, { format = "JWK" })
+  if not pk or err then
+    return false, "could not load JWK, likely not a valid key"
+  end
+  return true
+end
+
+local function validate_pem_keys(values)
+  local public_key = values.public_key
+  local private_key = values.private_key
+
+  -- unless it's a vault reference
+  if kong.vault.is_reference(private_key) or
+     kong.vault.is_reference(public_key) then
+    return true
+  end
+
+  local pk, err = openssl_pkey.new(public_key, { format = "PEM" })
+  if not pk or err then
+    return false, "could not load public key"
+  end
+
+  local ppk, perr = openssl_pkey.new(private_key, { format = "PEM" })
+  if not ppk or perr then
+    return false, "could not load private key" .. (perr or "")
+  end
+  return true
+end
+
+typedefs.pem = Schema.define {
+  type = "record",
+  required = false,
+  fields = {
+    {
+      private_key = {
+        type = "string",
+        required = false,
+        referenceable = true,
+        encrypted = true
+      },
+    },
+    {
+      public_key = {
+        type = "string",
+        referenceable = true,
+        required = false,
+      },
+    },
+  },
+  custom_validator = validate_pem_keys,
+}
+
+typedefs.jwk = Schema.define {
+  type = "record",
+  required = false,
+  fields = {
+    {
+      issuer = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      kty = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      use = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      key_ops = {
+        type = "array",
+        required = false,
+        elements = {
+          type = "string",
+          required = false,
+        }
+      },
+    },
+    {
+      alg = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      kid = {
+        type = "string",
+        required = true,
+      },
+    },
+    {
+      x5u = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      x5c = {
+        type = "array",
+        required = false,
+        elements = {
+          type = "string",
+          required = false,
+        },
+      },
+    },
+    {
+      x5t = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      ["x5t#S256"] = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      k = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      x = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      y = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      crv = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      n = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      e = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      d = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      p = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      q = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      dp = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      dq = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      qi = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      oth = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      r = {
+        type = "string",
+        required = false,
+      },
+    },
+    {
+      t = {
+        type = "string",
+        required = false,
+      },
+    },
+  },
+  custom_validator = validate_jwk
+}
+
+typedefs.queue = queue_schema
+
 local function validate_lua_expression(expression)
   local sandbox = require "kong.tools.sandbox"
   return sandbox.validate_safe(expression)
@@ -586,5 +825,10 @@ setmetatable(typedefs, {
   end
 })
 
+
+typedefs.ttl = Schema.define {
+  type = "number",
+  between = { 0, DAO_MAX_TTL },
+}
 
 return typedefs

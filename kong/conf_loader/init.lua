@@ -4,8 +4,10 @@ local require = require
 local kong_default_conf = require "kong.templates.kong_defaults"
 local process_secrets = require "kong.cmd.utils.process_secrets"
 local openssl_pkey = require "resty.openssl.pkey"
+local openssl_x509 = require "resty.openssl.x509"
 local pl_stringio = require "pl.stringio"
 local pl_stringx = require "pl.stringx"
+local socket_url = require "socket.url"
 local constants = require "kong.constants"
 local listeners = require "kong.conf_loader.listeners"
 local pl_pretty = require "pl.pretty"
@@ -43,6 +45,7 @@ local abspath = pl_path.abspath
 local tostring = tostring
 local tonumber = tonumber
 local setmetatable = setmetatable
+local try_decode_base64 = utils.try_decode_base64
 
 
 local get_phase do
@@ -280,7 +283,7 @@ end
 -- `boolean`: can be "on"/"off"/"true"/"false", will be inferred to a boolean
 -- `ngx_boolean`: can be "on"/"off", will be inferred to a string
 -- `array`: a comma-separated list
-local CONF_INFERENCES = {
+local CONF_PARSERS = {
   -- forced string inferences (or else are retrieved as numbers)
   port_maps = { typ = "array" },
   proxy_listen = { typ = "array" },
@@ -322,6 +325,7 @@ local CONF_INFERENCES = {
   upstream_keepalive_pool_size = { typ = "number" },
   upstream_keepalive_max_requests = { typ = "number" },
   upstream_keepalive_idle_timeout = { typ = "number" },
+  allow_debug_header = { typ = "boolean" },
 
   headers = { typ = "array" },
   trusted_ips = { typ = "array" },
@@ -353,6 +357,10 @@ local CONF_INFERENCES = {
   pg_ssl_verify = { typ = "boolean" },
   pg_max_concurrent_queries = { typ = "number" },
   pg_semaphore_timeout = { typ = "number" },
+  pg_keepalive_timeout = { typ = "number" },
+  pg_pool_size = { typ = "number" },
+  pg_backlog = { typ = "number" },
+  _debug_pg_ttl_cleanup_interval = { typ = "number" },
 
   pg_ro_port = { typ = "number" },
   pg_ro_timeout = { typ = "number" },
@@ -361,52 +369,9 @@ local CONF_INFERENCES = {
   pg_ro_ssl_verify = { typ = "boolean" },
   pg_ro_max_concurrent_queries = { typ = "number" },
   pg_ro_semaphore_timeout = { typ = "number" },
-
-  cassandra_contact_points = { typ = "array" },
-  cassandra_port = { typ = "number" },
-  cassandra_password = { typ = "string" },
-  cassandra_timeout = { typ = "number" },
-  cassandra_ssl = { typ = "boolean" },
-  cassandra_ssl_verify = { typ = "boolean" },
-  cassandra_write_consistency = { enum = {
-                                  "ALL",
-                                  "EACH_QUORUM",
-                                  "QUORUM",
-                                  "LOCAL_QUORUM",
-                                  "ONE",
-                                  "TWO",
-                                  "THREE",
-                                  "LOCAL_ONE",
-                                }
-                              },
-  cassandra_read_consistency = { enum = {
-                                  "ALL",
-                                  "EACH_QUORUM",
-                                  "QUORUM",
-                                  "LOCAL_QUORUM",
-                                  "ONE",
-                                  "TWO",
-                                  "THREE",
-                                  "LOCAL_ONE",
-                                }
-                              },
-  cassandra_lb_policy = { enum = {
-                            "RoundRobin",
-                            "RequestRoundRobin",
-                            "DCAwareRoundRobin",
-                            "RequestDCAwareRoundRobin",
-                          }
-                        },
-  cassandra_local_datacenter = { typ = "string" },
-  cassandra_refresh_frequency = { typ = "number" },
-  cassandra_repl_strategy = { enum = {
-                                "SimpleStrategy",
-                                "NetworkTopologyStrategy",
-                              }
-                            },
-  cassandra_repl_factor = { typ = "number" },
-  cassandra_data_centers = { typ = "array" },
-  cassandra_schema_consensus_timeout = { typ = "number" },
+  pg_ro_keepalive_timeout = { typ = "number" },
+  pg_ro_pool_size = { typ = "number" },
+  pg_ro_backlog = { typ = "number" },
 
   dns_resolver = { typ = "array" },
   dns_hostsfile = { typ = "string" },
@@ -435,7 +400,15 @@ local CONF_INFERENCES = {
       end,
     }
   },
+  router_flavor = {
+    enum = { "traditional", "traditional_compatible", "expressions" },
+  },
   worker_state_update_frequency = { typ = "number" },
+
+  lua_max_req_headers = { typ = "number" },
+  lua_max_resp_headers = { typ = "number" },
+  lua_max_uri_args = { typ = "number" },
+  lua_max_post_args = { typ = "number" },
 
   ssl_protocols = {
     typ = "string",
@@ -472,6 +445,7 @@ local CONF_INFERENCES = {
       "nginx_stream_ssl_session_timeout",
     },
   },
+  ssl_session_cache_size = { typ = "string" },
 
   client_ssl = { typ = "boolean" },
 
@@ -519,6 +493,8 @@ local CONF_INFERENCES = {
   cluster_data_plane_purge_delay = { typ = "number" },
   cluster_ocsp = { enum = { "on", "off", "optional" } },
   cluster_max_payload = { typ = "number" },
+  cluster_use_proxy = { typ = "boolean" },
+  cluster_dp_labels = { typ = "array" },
 
   kic = { typ = "boolean" },
   pluginserver_names = { typ = "array" },
@@ -527,13 +503,44 @@ local CONF_INFERENCES = {
   untrusted_lua_sandbox_requires = { typ = "array" },
   untrusted_lua_sandbox_environment = { typ = "array" },
 
-  legacy_worker_events = { typ = "boolean" },
-
   lmdb_environment_path = { typ = "string" },
   lmdb_map_size = { typ = "string" },
 
-  opentelemetry_tracing = { typ = "array" },
-  opentelemetry_tracing_sampling_rate = { typ = "number" },
+  opentelemetry_tracing = {
+    typ = "array",
+    alias = {
+      replacement = "tracing_instrumentations",
+    },
+    deprecated = {
+      replacement = "tracing_instrumentations",
+    },
+  },
+
+  tracing_instrumentations = {
+    typ = "array",
+  },
+
+  opentelemetry_tracing_sampling_rate = {
+    typ = "number",
+    deprecated = {
+      replacement = "tracing_sampling_rate",
+    },
+    alias = {
+      replacement = "tracing_sampling_rate",
+    },
+  },
+
+  tracing_sampling_rate = {
+    typ = "number",
+  },
+
+  proxy_server = { typ = "string" },
+  proxy_server_ssl_verify = { typ = "boolean" },
+
+  error_template_html = { typ = "string" },
+  error_template_json = { typ = "string" },
+  error_template_xml = { typ = "string" },
+  error_template_plain = { typ = "string" },
 }
 
 
@@ -543,7 +550,7 @@ local CONF_SENSITIVE_PLACEHOLDER = "******"
 local CONF_SENSITIVE = {
   pg_password = true,
   pg_ro_password = true,
-  cassandra_password = true,
+  proxy_server = true, -- hide proxy server URL as it may contain credentials
 }
 
 
@@ -569,15 +576,8 @@ local _nop_tostring_mt = {
 }
 
 
-local function infer_value(value, typ, opts)
+local function parse_value(value, typ)
   if type(value) == "string" then
-    if not opts.from_kong_env then
-      -- remove trailing comment, if any
-      -- and remove escape chars from octothorpes
-      value = gsub(value, "[^\\]#.-$", "")
-      value = gsub(value, "\\#", "#")
-    end
-
     value = strip(value)
   end
 
@@ -619,13 +619,13 @@ end
 
 -- Validate properties (type/enum/custom) and infer their type.
 -- @param[type=table] conf The configuration table to treat.
-local function check_and_infer(conf, opts)
+local function check_and_parse(conf, opts)
   local errors = {}
 
   for k, value in pairs(conf) do
-    local v_schema = CONF_INFERENCES[k] or {}
+    local v_schema = CONF_PARSERS[k] or {}
 
-    value = infer_value(value, v_schema.typ, opts)
+    value = parse_value(value, v_schema.typ)
 
     local typ = v_schema.typ or "string"
     if value and not typ_checks[typ](value) then
@@ -673,46 +673,6 @@ local function check_and_infer(conf, opts)
     end
   end
 
-  if conf.database == "cassandra" then
-    log.deprecation("Support for Cassandra is deprecated. Please refer to " ..
-                    "https://konghq.com/blog/cassandra-support-deprecated", {
-      after   = "2.7",
-      removal = "4.0"
-    })
-
-    if find(conf.cassandra_lb_policy, "DCAware", nil, true)
-       and not conf.cassandra_local_datacenter
-    then
-      errors[#errors + 1] = "must specify 'cassandra_local_datacenter' when " ..
-                            conf.cassandra_lb_policy .. " policy is in use"
-    end
-
-    if conf.cassandra_refresh_frequency < 0 then
-      errors[#errors + 1] = "cassandra_refresh_frequency must be 0 or greater"
-    end
-
-    for _, contact_point in ipairs(conf.cassandra_contact_points) do
-      local endpoint, err = utils.normalize_ip(contact_point)
-      if not endpoint then
-        errors[#errors + 1] = fmt("bad cassandra contact point '%s': %s",
-                                  contact_point, err)
-
-      elseif endpoint.port then
-        errors[#errors + 1] = fmt("bad cassandra contact point '%s': %s",
-                                  contact_point,
-                                  "port must be specified in cassandra_port")
-      end
-    end
-
-    -- cache settings check
-
-    if conf.db_update_propagation == 0 then
-      log.warn("You are using Cassandra but your 'db_update_propagation' " ..
-               "setting is set to '0' (default). Due to the distributed "  ..
-               "nature of Cassandra, you should increase this value.")
-    end
-  end
-
   for _, prefix in ipairs({ "proxy_", "admin_", "status_" }) do
     local listen = conf[prefix .. "listen"]
 
@@ -743,50 +703,74 @@ local function check_and_infer(conf, opts)
       end
 
       if ssl_cert then
-        for _, cert in ipairs(ssl_cert) do
+        for i, cert in ipairs(ssl_cert) do
           if not exists(cert) then
-            errors[#errors + 1] = prefix .. "ssl_cert: no such file at " .. cert
+            cert = try_decode_base64(cert)
+            ssl_cert[i] = cert
+            local _, err = openssl_x509.new(cert)
+            if err then
+              errors[#errors + 1] = prefix .. "ssl_cert: failed loading certificate from " .. cert
+            end
           end
         end
+        conf[prefix .. "ssl_cert"] = ssl_cert
       end
 
       if ssl_cert_key then
-        for _, cert_key in ipairs(ssl_cert_key) do
+        for i, cert_key in ipairs(ssl_cert_key) do
           if not exists(cert_key) then
-            errors[#errors + 1] = prefix .. "ssl_cert_key: no such file at " .. cert_key
+            cert_key = try_decode_base64(cert_key)
+            ssl_cert_key[i] = cert_key
+            local _, err = openssl_pkey.new(cert_key)
+            if err then
+              errors[#errors + 1] = prefix .. "ssl_cert_key: failed loading key from " .. cert_key
+            end
           end
         end
+        conf[prefix .. "ssl_cert_key"] = ssl_cert_key
       end
     end
   end
 
   if conf.client_ssl then
-    if conf.client_ssl_cert and not conf.client_ssl_cert_key then
+    local client_ssl_cert = conf.client_ssl_cert
+    local client_ssl_cert_key = conf.client_ssl_cert_key
+
+    if client_ssl_cert and not client_ssl_cert_key then
       errors[#errors + 1] = "client_ssl_cert_key must be specified"
 
-    elseif conf.client_ssl_cert_key and not conf.client_ssl_cert then
+    elseif client_ssl_cert_key and not client_ssl_cert then
       errors[#errors + 1] = "client_ssl_cert must be specified"
     end
 
-    if conf.client_ssl_cert and not exists(conf.client_ssl_cert) then
-      errors[#errors + 1] = "client_ssl_cert: no such file at " ..
-                          conf.client_ssl_cert
+    if client_ssl_cert and not exists(client_ssl_cert) then
+      client_ssl_cert = try_decode_base64(client_ssl_cert)
+      conf.client_ssl_cert = client_ssl_cert
+      local _, err = openssl_x509.new(client_ssl_cert)
+      if err then
+        errors[#errors + 1] = "client_ssl_cert: failed loading certificate from " .. client_ssl_cert
+      end
     end
 
-    if conf.client_ssl_cert_key and not exists(conf.client_ssl_cert_key) then
-      errors[#errors + 1] = "client_ssl_cert_key: no such file at " ..
-                          conf.client_ssl_cert_key
+    if client_ssl_cert_key and not exists(client_ssl_cert_key) then
+      client_ssl_cert_key = try_decode_base64(client_ssl_cert_key)
+      conf.client_ssl_cert_key = client_ssl_cert_key
+      local _, err = openssl_pkey.new(client_ssl_cert_key)
+      if err then
+        errors[#errors + 1] = "client_ssl_cert_key: failed loading key from " ..
+                               client_ssl_cert_key
+      end
     end
   end
 
   if conf.lua_ssl_trusted_certificate then
     local new_paths = {}
 
-    for _, path in ipairs(conf.lua_ssl_trusted_certificate) do
-      if path == "system" then
+    for _, trusted_cert in ipairs(conf.lua_ssl_trusted_certificate) do
+      if trusted_cert == "system" then
         local system_path, err = utils.get_system_trusted_certs_filepath()
         if system_path then
-          path = system_path
+          trusted_cert = system_path
 
         elseif not ngx.IS_CLI then
           log.info("lua_ssl_trusted_certificate: unable to locate system bundle: " .. err ..
@@ -795,12 +779,18 @@ local function check_and_infer(conf, opts)
         end
       end
 
-      if path ~= "system" then
-        if not exists(path) then
-          errors[#errors + 1] = "lua_ssl_trusted_certificate: no such file at " .. path
+      if trusted_cert ~= "system" then
+        if not exists(trusted_cert) then
+          trusted_cert = try_decode_base64(trusted_cert)
+          local _, err = openssl_x509.new(trusted_cert)
+          if err then
+            errors[#errors + 1] = "lua_ssl_trusted_certificate: " ..
+                                  "failed loading certificate from " ..
+                                  trusted_cert
+          end
         end
 
-        new_paths[#new_paths + 1] = path
+        new_paths[#new_paths + 1] = trusted_cert
       end
     end
 
@@ -831,8 +821,19 @@ local function check_and_infer(conf, opts)
   end
 
   if conf.ssl_dhparam then
-    if not is_predefined_dhgroup(conf.ssl_dhparam) and not exists(conf.ssl_dhparam) then
-      errors[#errors + 1] = "ssl_dhparam: no such file at " .. conf.ssl_dhparam
+    if not is_predefined_dhgroup(conf.ssl_dhparam)
+       and not exists(conf.ssl_dhparam) then
+      conf.ssl_dhparam = try_decode_base64(conf.ssl_dhparam)
+      local _, err = openssl_pkey.new(
+        {
+          type = "DH",
+          param = conf.ssl_dhparam
+        }
+      )
+      if err then
+        errors[#errors + 1] = "ssl_dhparam: failed loading certificate from "
+                              .. conf.ssl_dhparam
+      end
     end
 
   else
@@ -872,18 +873,13 @@ local function check_and_infer(conf, opts)
   end
 
   if conf.dns_order then
-    local allowed = { LAST = true, A = true, CNAME = true,
-                      SRV = true, AAAA = true }
+    local allowed = { LAST = true, A = true, AAAA = true,
+                      CNAME = true, SRV = true }
 
     for _, name in ipairs(conf.dns_order) do
       if not allowed[upper(name)] then
         errors[#errors + 1] = fmt("dns_order: invalid entry '%s'",
                                   tostring(name))
-      end
-      if upper(name) == "AAAA" then
-        log.warn("the 'dns_order' configuration property specifies the " ..
-                 "experimental IPv6 entry 'AAAA'")
-
       end
     end
   end
@@ -917,6 +913,36 @@ local function check_and_infer(conf, opts)
     errors[#errors + 1] = "pg_semaphore_timeout must be an integer greater than 0"
   end
 
+  if conf.pg_keepalive_timeout then
+    if conf.pg_keepalive_timeout < 0 then
+      errors[#errors + 1] = "pg_keepalive_timeout must be greater than 0"
+    end
+
+    if conf.pg_keepalive_timeout ~= floor(conf.pg_keepalive_timeout) then
+      errors[#errors + 1] = "pg_keepalive_timeout must be an integer greater than 0"
+    end
+  end
+
+  if conf.pg_pool_size then
+    if conf.pg_pool_size < 0 then
+      errors[#errors + 1] = "pg_pool_size must be greater than 0"
+    end
+
+    if conf.pg_pool_size ~= floor(conf.pg_pool_size) then
+      errors[#errors + 1] = "pg_pool_size must be an integer greater than 0"
+    end
+  end
+
+  if conf.pg_backlog then
+    if conf.pg_backlog < 0 then
+      errors[#errors + 1] = "pg_backlog must be greater than 0"
+    end
+
+    if conf.pg_backlog ~= floor(conf.pg_backlog) then
+      errors[#errors + 1] = "pg_backlog must be an integer greater than 0"
+    end
+  end
+
   if conf.pg_ro_max_concurrent_queries then
     if conf.pg_ro_max_concurrent_queries < 0 then
       errors[#errors + 1] = "pg_ro_max_concurrent_queries must be greater than 0"
@@ -937,8 +963,57 @@ local function check_and_infer(conf, opts)
     end
   end
 
+  if conf.pg_ro_keepalive_timeout then
+    if conf.pg_ro_keepalive_timeout < 0 then
+      errors[#errors + 1] = "pg_ro_keepalive_timeout must be greater than 0"
+    end
+
+    if conf.pg_ro_keepalive_timeout ~= floor(conf.pg_ro_keepalive_timeout) then
+      errors[#errors + 1] = "pg_ro_keepalive_timeout must be an integer greater than 0"
+    end
+  end
+
+  if conf.pg_ro_pool_size then
+    if conf.pg_ro_pool_size < 0 then
+      errors[#errors + 1] = "pg_ro_pool_size must be greater than 0"
+    end
+
+    if conf.pg_ro_pool_size ~= floor(conf.pg_ro_pool_size) then
+      errors[#errors + 1] = "pg_ro_pool_size must be an integer greater than 0"
+    end
+  end
+
+  if conf.pg_ro_backlog then
+    if conf.pg_ro_backlog < 0 then
+      errors[#errors + 1] = "pg_ro_backlog must be greater than 0"
+    end
+
+    if conf.pg_ro_backlog ~= floor(conf.pg_ro_backlog) then
+      errors[#errors + 1] = "pg_ro_backlog must be an integer greater than 0"
+    end
+  end
+
   if conf.worker_state_update_frequency <= 0 then
     errors[#errors + 1] = "worker_state_update_frequency must be greater than 0"
+  end
+
+  if conf.proxy_server then
+    local parsed, err = socket_url.parse(conf.proxy_server)
+    if err then
+      errors[#errors + 1] = "proxy_server is invalid: " .. err
+
+    elseif not parsed.scheme then
+      errors[#errors + 1] = "proxy_server missing scheme"
+
+    elseif parsed.scheme ~= "http" and parsed.scheme ~= "https" then
+      errors[#errors + 1] = "proxy_server only supports \"http\" and \"https\", got " .. parsed.scheme
+
+    elseif not parsed.host then
+      errors[#errors + 1] = "proxy_server missing host"
+
+    elseif parsed.fragment or parsed.query or parsed.params then
+      errors[#errors + 1] = "fragments, query strings or parameters are meaningless in proxy configuration"
+    end
   end
 
   if conf.role == "control_plane" then
@@ -958,6 +1033,14 @@ local function check_and_infer(conf, opts)
       errors[#errors + 1] = "in-memory storage can not be used when role = \"control_plane\""
     end
 
+    if conf.cluster_use_proxy then
+      errors[#errors + 1] = "cluster_use_proxy can not be used when role = \"control_plane\""
+    end
+
+    if conf.cluster_dp_labels and #conf.cluster_dp_labels > 0 then
+      errors[#errors + 1] = "cluster_dp_labels can not be used when role = \"control_plane\""
+    end
+
   elseif conf.role == "data_plane" then
     if #conf.proxy_listen < 1 or strip(conf.proxy_listen[1]) == "off" then
       errors[#errors + 1] = "proxy_listen must be specified when role = \"data_plane\""
@@ -975,8 +1058,24 @@ local function check_and_infer(conf, opts)
     if conf.cluster_mtls == "shared" then
       insert(conf.lua_ssl_trusted_certificate, conf.cluster_cert)
 
-    elseif conf.cluster_mtls == "pki" then
+    elseif conf.cluster_mtls == "pki" or conf.cluster_mtls == "pki_check_cn" then
       insert(conf.lua_ssl_trusted_certificate, conf.cluster_ca_cert)
+    end
+
+    if conf.cluster_use_proxy and not conf.proxy_server then
+      errors[#errors + 1] = "cluster_use_proxy is turned on but no proxy_server is configured"
+    end
+
+    if conf.cluster_dp_labels then
+      local _, err = utils.validate_labels(conf.cluster_dp_labels)
+      if err then
+       errors[#errors + 1] = err
+      end
+    end
+
+  else
+    if conf.cluster_dp_labels and #conf.cluster_dp_labels > 0 then
+      errors[#errors + 1] = "cluster_dp_labels can only be used when role = \"data_plane\""
     end
   end
 
@@ -989,18 +1088,40 @@ local function check_and_infer(conf, opts)
   end
 
   if conf.role == "control_plane" or conf.role == "data_plane" then
-    if not conf.cluster_cert or not conf.cluster_cert_key then
+    local cluster_cert = conf.cluster_cert
+    local cluster_cert_key = conf.cluster_cert_key
+    local cluster_ca_cert = conf.cluster_ca_cert
+
+    if not cluster_cert or not cluster_cert_key then
       errors[#errors + 1] = "cluster certificate and key must be provided to use Hybrid mode"
 
     else
-      if not exists(conf.cluster_cert) then
-        errors[#errors + 1] = "cluster_cert: no such file at " ..
-                              conf.cluster_cert
+      if not exists(cluster_cert) then
+        cluster_cert = try_decode_base64(cluster_cert)
+        conf.cluster_cert = cluster_cert
+        local _, err = openssl_x509.new(cluster_cert)
+        if err then
+          errors[#errors + 1] = "cluster_cert: failed loading certificate from " .. cluster_cert
+        end
       end
 
-      if not exists(conf.cluster_cert_key) then
-        errors[#errors + 1] = "cluster_cert_key: no such file at " ..
-                              conf.cluster_cert_key
+      if not exists(cluster_cert_key) then
+        cluster_cert_key = try_decode_base64(cluster_cert_key)
+        conf.cluster_cert_key = cluster_cert_key
+        local _, err = openssl_pkey.new(cluster_cert_key)
+        if err then
+          errors[#errors + 1] = "cluster_cert_key: failed loading key from " .. cluster_cert_key
+        end
+      end
+    end
+
+    if cluster_ca_cert and not exists(cluster_ca_cert) then
+      cluster_ca_cert = try_decode_base64(cluster_ca_cert)
+      conf.cluster_ca_cert = cluster_ca_cert
+      local _, err = openssl_x509.new(cluster_ca_cert)
+      if err then
+        errors[#errors + 1] = "cluster_ca_cert: failed loading certificate from " ..
+                              cluster_ca_cert
       end
     end
   end
@@ -1017,27 +1138,60 @@ local function check_and_infer(conf, opts)
     errors[#errors + 1] = "upstream_keepalive_idle_timeout must be 0 or greater"
   end
 
-  if conf.opentelemetry_tracing and #conf.opentelemetry_tracing > 0 then
+  if conf.tracing_instrumentations and #conf.tracing_instrumentations > 0 then
     local instrumentation = require "kong.tracing.instrumentation"
     local available_types_map = tablex.deepcopy(instrumentation.available_types)
     available_types_map["all"] = true
     available_types_map["off"] = true
+    available_types_map["request"] = true
 
-    for _, trace_type in ipairs(conf.opentelemetry_tracing) do
+    for _, trace_type in ipairs(conf.tracing_instrumentations) do
       if not available_types_map[trace_type] then
-        errors[#errors + 1] = "invalid opentelemetry tracing type: " .. trace_type
+        errors[#errors + 1] = "invalid tracing type: " .. trace_type
       end
     end
 
-    if tablex.find(conf.opentelemetry_tracing, "off")
-      and tablex.find(conf.opentelemetry_tracing, "all")
+    if #conf.tracing_instrumentations > 1
+      and tablex.find(conf.tracing_instrumentations, "off")
     then
-      errors[#errors + 1] = "invalid opentelemetry tracing types: off, all are mutually exclusive"
+      errors[#errors + 1] = "invalid tracing types: off, other types are mutually exclusive"
     end
 
-    if conf.opentelemetry_tracing_sampling_rate < 0 or conf.opentelemetry_tracing_sampling_rate > 1 then
-      errors[#errors + 1] = "opentelemetry_tracing_sampling_rate must be between 0 and 1"
+    if conf.tracing_sampling_rate < 0 or conf.tracing_sampling_rate > 1 then
+      errors[#errors + 1] = "tracing_sampling_rate must be between 0 and 1"
     end
+  end
+
+  if conf.lua_max_req_headers < 1 or conf.lua_max_req_headers > 1000
+  or conf.lua_max_req_headers ~= floor(conf.lua_max_req_headers)
+  then
+    errors[#errors + 1] = "lua_max_req_headers must be an integer between 1 and 1000"
+  end
+
+  if conf.lua_max_resp_headers < 1 or conf.lua_max_resp_headers > 1000
+  or conf.lua_max_resp_headers ~= floor(conf.lua_max_resp_headers)
+  then
+    errors[#errors + 1] = "lua_max_resp_headers must be an integer between 1 and 1000"
+  end
+
+  if conf.lua_max_uri_args < 1 or conf.lua_max_uri_args > 1000
+  or conf.lua_max_uri_args ~= floor(conf.lua_max_uri_args)
+  then
+    errors[#errors + 1] = "lua_max_uri_args must be an integer between 1 and 1000"
+  end
+
+  if conf.lua_max_post_args < 1 or conf.lua_max_post_args > 1000
+  or conf.lua_max_post_args ~= floor(conf.lua_max_post_args)
+  then
+    errors[#errors + 1] = "lua_max_post_args must be an integer between 1 and 1000"
+  end
+
+  if conf.node_id and not utils.is_valid_uuid(conf.node_id) then
+    errors[#errors + 1] = "node_id must be a valid UUID"
+  end
+
+  if conf.database == "cassandra" then
+    errors[#errors + 1] = "Cassandra as a datastore for Kong is not supported in versions 3.4 and above. Please use Postgres."
   end
 
   return #errors == 0, errors[1], errors
@@ -1048,7 +1202,6 @@ local function overrides(k, default_v, opts, file_conf, arg_conf)
   opts = opts or {}
 
   local value -- definitive value for this property
-  local escape -- whether to escape a value's octothorpes
 
   -- default values have lowest priority
 
@@ -1079,23 +1232,12 @@ local function overrides(k, default_v, opts, file_conf, arg_conf)
       log.debug('%s ENV found with "%s"', env_name, to_print)
 
       value = env
-      escape = true
     end
   end
 
   -- arg_conf have highest priority
   if arg_conf and arg_conf[k] ~= nil then
     value = arg_conf[k]
-    escape = true
-  end
-
-  if escape and type(value) == "string" then
-    -- Escape "#" in env vars or overrides to avoid them being mangled by
-    -- comments stripping logic.
-    repeat
-      local s, n = gsub(value, [[([^\])#]], [[%1\#]])
-      value = s
-    until n == 0
   end
 
   return value, k
@@ -1124,7 +1266,7 @@ end
 
 
 local function aliased_properties(conf)
-  for property_name, v_schema in pairs(CONF_INFERENCES) do
+  for property_name, v_schema in pairs(CONF_PARSERS) do
     local alias = v_schema.alias
 
     if alias and conf[property_name] ~= nil and conf[alias.replacement] == nil then
@@ -1143,7 +1285,7 @@ end
 
 
 local function deprecated_properties(conf, opts)
-  for property_name, v_schema in pairs(CONF_INFERENCES) do
+  for property_name, v_schema in pairs(CONF_PARSERS) do
     local deprecated = v_schema.deprecated
 
     if deprecated and conf[property_name] ~= nil then
@@ -1169,7 +1311,7 @@ end
 
 
 local function dynamic_properties(conf)
-  for property_name, v_schema in pairs(CONF_INFERENCES) do
+  for property_name, v_schema in pairs(CONF_PARSERS) do
     local value = conf[property_name]
     if value ~= nil then
       local directives = v_schema.directives
@@ -1188,6 +1330,35 @@ local function dynamic_properties(conf)
 end
 
 
+local function load_config(thing)
+  local s = pl_stringio.open(thing)
+  local conf, err = pl_config.read(s, {
+    smart = false,
+    list_delim = "_blank_" -- mandatory but we want to ignore it
+  })
+  s:close()
+  if not conf then
+    return nil, err
+  end
+
+  local function strip_comments(value)
+    -- remove trailing comment, if any
+    -- and remove escape chars from octothorpes
+    if value then
+      value = ngx.re.sub(value, [[\s*(?<!\\)#.*$]], "")
+      value = gsub(value, "\\#", "#")
+    end
+    return value
+  end
+
+  for key, value in pairs(conf) do
+    conf[key] = strip_comments(value)
+  end
+
+  return conf
+end
+
+
 --- Load Kong configuration file
 -- The loaded configuration will only contain properties read from the
 -- passed configuration file (properties are not merged with defaults or
@@ -1201,17 +1372,7 @@ local function load_config_file(path)
     return nil, err
   end
 
-  local s = pl_stringio.open(f)
-  local conf, err = pl_config.read(s, {
-    smart = false,
-    list_delim = "_blank_" -- mandatory but we want to ignore it
-  })
-  s:close()
-  if not conf then
-    return nil, err
-  end
-
-  return conf
+  return load_config(f)
 end
 
 
@@ -1232,12 +1393,7 @@ local function load(path, custom_conf, opts)
   ------------------------
 
   -- load defaults, they are our mandatory base
-  local s = pl_stringio.open(kong_default_conf)
-  local defaults, err = pl_config.read(s, {
-    smart = false,
-    list_delim = "_blank_" -- mandatory but we want to ignore it
-  })
-  s:close()
+  local defaults, err = load_config(kong_default_conf)
   if not defaults then
     return nil, "could not load default conf: " .. err
   end
@@ -1289,7 +1445,7 @@ local function load(path, custom_conf, opts)
     local function add_dynamic_keys(t)
       t = t or {}
 
-      for property_name, v_schema in pairs(CONF_INFERENCES) do
+      for property_name, v_schema in pairs(CONF_PARSERS) do
         local directives = v_schema.directives
         if directives then
           local v = t[property_name]
@@ -1387,7 +1543,7 @@ local function load(path, custom_conf, opts)
   local refs
   do
     -- validation
-    local vaults_array = infer_value(conf.vaults, CONF_INFERENCES["vaults"].typ, opts)
+    local vaults_array = parse_value(conf.vaults, CONF_PARSERS["vaults"].typ)
 
     -- merge vaults
     local vaults = {}
@@ -1431,7 +1587,7 @@ local function load(path, custom_conf, opts)
         end
 
         for k, deref in pairs(secrets) do
-          local v = infer_value(conf[k], "string", opts)
+          local v = parse_value(conf[k], "string")
           if refs then
             refs[k] = v
           else
@@ -1446,14 +1602,14 @@ local function load(path, custom_conf, opts)
       local vault_conf = { loaded_vaults = loaded_vaults }
       for k, v in pairs(conf) do
         if sub(k, 1, 6) == "vault_" then
-          vault_conf[k] = infer_value(v, "string", opts)
+          vault_conf[k] = parse_value(v, "string")
         end
       end
 
       local vault = require("kong.pdk.vault").new({ configuration = vault_conf })
 
       for k, v in pairs(conf) do
-        v = infer_value(v, "string", opts)
+        v = parse_value(v, "string")
         if vault.is_reference(v) then
           if refs then
             refs[k] = v
@@ -1463,10 +1619,11 @@ local function load(path, custom_conf, opts)
 
           local deref, deref_err = vault.get(v)
           if deref == nil or deref_err then
-            return nil, fmt("failed to dereference '%s': %s for config option '%s'", v, deref_err, k)
-          end
+            if opts.starting then
+              return nil, fmt("failed to dereference '%s': %s for config option '%s'", v, deref_err, k)
+            end
 
-          if deref ~= nil then
+          else
             conf[k] = deref
           end
         end
@@ -1475,7 +1632,7 @@ local function load(path, custom_conf, opts)
   end
 
   -- validation
-  local ok, err, errors = check_and_infer(conf, opts)
+  local ok, err, errors = check_and_parse(conf, opts)
 
   if not opts.starting then
     log.enable()
@@ -1642,7 +1799,7 @@ local function load(path, custom_conf, opts)
     { name = "proxy_listen",   subsystem = "http",   ssl_flag = "proxy_ssl_enabled" },
     { name = "stream_listen",  subsystem = "stream", ssl_flag = "stream_proxy_ssl_enabled" },
     { name = "admin_listen",   subsystem = "http",   ssl_flag = "admin_ssl_enabled" },
-    { name = "status_listen",  flags = { "ssl" },    ssl_flag = "status_ssl_enabled" },
+    { name = "status_listen",  subsystem = "http",   ssl_flag = "status_ssl_enabled" },
     { name = "cluster_listen", subsystem = "http" },
   })
   if not ok then
@@ -1690,25 +1847,29 @@ local function load(path, custom_conf, opts)
     if ssl_cert and ssl_cert_key then
       if type(ssl_cert) == "table" then
         for i, cert in ipairs(ssl_cert) do
-          ssl_cert[i] = abspath(cert)
+          if exists(ssl_cert[i]) then
+            ssl_cert[i] = abspath(cert)
+          end
         end
 
-      else
+      elseif exists(ssl_cert) then
         conf[prefix .. "_cert"] = abspath(ssl_cert)
       end
 
-      if type(ssl_cert) == "table" then
+      if type(ssl_cert_key) == "table" then
         for i, key in ipairs(ssl_cert_key) do
-          ssl_cert_key[i] = abspath(key)
+          if exists(ssl_cert_key[i]) then
+            ssl_cert_key[i] = abspath(key)
+          end
         end
 
-      else
+      elseif exists(ssl_cert_key) then
         conf[prefix .. "_cert_key"] = abspath(ssl_cert_key)
       end
     end
   end
 
-  if conf.cluster_ca_cert then
+  if conf.cluster_ca_cert and exists(conf.cluster_ca_cert) then
     conf.cluster_ca_cert = abspath(conf.cluster_ca_cert)
   end
 
@@ -1728,7 +1889,7 @@ local function load(path, custom_conf, opts)
             remove(conf[name], i)
           end
 
-        else
+        elseif exists(directive.value) then
           directive.value = abspath(directive.value)
         end
 
@@ -1739,8 +1900,16 @@ local function load(path, custom_conf, opts)
 
   if conf.lua_ssl_trusted_certificate
      and #conf.lua_ssl_trusted_certificate > 0 then
-    conf.lua_ssl_trusted_certificate =
-      tablex.map(pl_path.abspath, conf.lua_ssl_trusted_certificate)
+
+    conf.lua_ssl_trusted_certificate = tablex.map(
+      function(cert)
+        if exists(cert) then
+          return abspath(cert)
+        end
+        return cert
+      end,
+      conf.lua_ssl_trusted_certificate
+    )
 
     conf.lua_ssl_trusted_certificate_combined =
       abspath(pl_path.join(conf.prefix, ".ca_combined"))
@@ -1752,6 +1921,15 @@ local function load(path, custom_conf, opts)
   end
 
   log.verbose("prefix in use: %s", conf.prefix)
+
+  -- hybrid mode HTTP tunneling (CONNECT) proxy inside HTTPS
+  if conf.cluster_use_proxy then
+    -- throw err, assume it's already handled in check_and_parse
+    local parsed = assert(socket_url.parse(conf.proxy_server))
+    if parsed.scheme == "https" then
+      conf.cluster_ssl_tunnel = fmt("%s:%s", parsed.host, parsed.port or 443)
+    end
+  end
 
   -- initialize the dns client, so the globally patched tcp.connect method
   -- will work from here onwards.

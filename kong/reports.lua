@@ -48,6 +48,13 @@ local UDP_STREAM_COUNT_KEY    = "events:streams:udp"
 local GO_PLUGINS_REQUEST_COUNT_KEY = "events:requests:go_plugins"
 
 
+local ROUTE_CACHE_HITS_KEY = "route_cache_hits"
+local STEAM_ROUTE_CACHE_HITS_KEY_POS = STREAM_COUNT_KEY .. ":" .. ROUTE_CACHE_HITS_KEY .. ":pos"
+local STEAM_ROUTE_CACHE_HITS_KEY_NEG = STREAM_COUNT_KEY .. ":" .. ROUTE_CACHE_HITS_KEY .. ":neg"
+local REQUEST_ROUTE_CACHE_HITS_KEY_POS = REQUEST_COUNT_KEY .. ":" .. ROUTE_CACHE_HITS_KEY .. ":pos"
+local REQUEST_ROUTE_CACHE_HITS_KEY_NEG = REQUEST_COUNT_KEY .. ":" .. ROUTE_CACHE_HITS_KEY .. ":neg"
+
+
 local _buffer = {}
 local _ping_infos = {}
 local _enabled = false
@@ -107,7 +114,7 @@ end
 
 local function send_report(signal_type, t, host, port)
   if not _enabled then
-    return
+    return nil, "disabled"
   elseif type(signal_type) ~= "string" then
     return error("signal_type (arg #1) must be a string", 2)
   end
@@ -141,21 +148,32 @@ local function send_report(signal_type, t, host, port)
   -- errors are not logged to avoid false positives for users
   -- who run Kong in an air-gapped environments
 
-  local ok = sock:connect(host, port)
+  local ok, err
+  ok, err = sock:connect(host, port)
   if not ok then
-    return
+    sock:close()
+    return nil, err
   end
 
-  local hs_ok, err = sock:sslhandshake(_ssl_session, nil, _ssl_verify)
-  if not hs_ok then
+  ok, err = sock:sslhandshake(_ssl_session, nil, _ssl_verify)
+  if not ok then
     log(DEBUG, "failed to complete SSL handshake for reports: ", err)
-    return
+    sock:close()
+    return nil, "failed to complete SSL handshake for reports: " .. err
   end
 
-  _ssl_session = hs_ok
+  _ssl_session = ok
 
-  sock:send(concat(_buffer, ";", 1, mutable_idx) .. "\n")
-  sock:setkeepalive()
+  -- send return nil plus err msg on failure
+  local bytes, err = sock:send(concat(_buffer, ";", 1, mutable_idx) .. "\n")
+  if bytes then
+    local ok, err = sock:setkeepalive()
+    if not ok then
+      log(DEBUG, "failed to keepalive to ", host, ":", tostring(port), ": ", err)
+      sock:close()
+    end
+  end
+  return bytes, err
 end
 
 
@@ -294,6 +312,9 @@ local function send_ping(host, port)
     _ping_infos.tls_streams = get_counter(TLS_STREAM_COUNT_KEY)
     _ping_infos.go_plugin_reqs = get_counter(GO_PLUGINS_REQUEST_COUNT_KEY)
 
+    _ping_infos.stream_route_cache_hit_pos = get_counter(STEAM_ROUTE_CACHE_HITS_KEY_POS)
+    _ping_infos.stream_route_cache_hit_neg = get_counter(STEAM_ROUTE_CACHE_HITS_KEY_NEG)
+
     send_report("ping", _ping_infos, host, port)
 
     reset_counter(STREAM_COUNT_KEY, _ping_infos.streams)
@@ -301,7 +322,8 @@ local function send_ping(host, port)
     reset_counter(UDP_STREAM_COUNT_KEY, _ping_infos.udp_streams)
     reset_counter(TLS_STREAM_COUNT_KEY, _ping_infos.tls_streams)
     reset_counter(GO_PLUGINS_REQUEST_COUNT_KEY, _ping_infos.go_plugin_reqs)
-
+    reset_counter(STEAM_ROUTE_CACHE_HITS_KEY_POS, _ping_infos.stream_route_cache_hit_pos)
+    reset_counter(STEAM_ROUTE_CACHE_HITS_KEY_NEG, _ping_infos.stream_route_cache_hit_neg)
     return
   end
 
@@ -316,6 +338,9 @@ local function send_ping(host, port)
   _ping_infos.wss_reqs       = get_counter(WSS_REQUEST_COUNT_KEY)
   _ping_infos.go_plugin_reqs = get_counter(GO_PLUGINS_REQUEST_COUNT_KEY)
 
+  _ping_infos.request_route_cache_hit_pos = get_counter(REQUEST_ROUTE_CACHE_HITS_KEY_POS)
+  _ping_infos.request_route_cache_hit_neg = get_counter(REQUEST_ROUTE_CACHE_HITS_KEY_NEG)
+
   send_report("ping", _ping_infos, host, port)
 
   reset_counter(REQUEST_COUNT_KEY,       _ping_infos.requests)
@@ -328,6 +353,8 @@ local function send_ping(host, port)
   reset_counter(WS_REQUEST_COUNT_KEY,    _ping_infos.ws_reqs)
   reset_counter(WSS_REQUEST_COUNT_KEY,   _ping_infos.wss_reqs)
   reset_counter(GO_PLUGINS_REQUEST_COUNT_KEY, _ping_infos.go_plugin_reqs)
+  reset_counter(REQUEST_ROUTE_CACHE_HITS_KEY_POS, _ping_infos.request_route_cache_hit_pos)
+  reset_counter(REQUEST_ROUTE_CACHE_HITS_KEY_NEG, _ping_infos.request_route_cache_hit_neg)
 end
 
 
@@ -409,8 +436,11 @@ do
   end
 end
 
-
 return {
+  init = function(kong_conf)
+    _enabled = kong_conf.anonymous_reports or false
+    configure_ping(kong_conf)
+  end,
   -- plugin handler
   init_worker = function()
     if not _enabled then
@@ -447,6 +477,12 @@ return {
     local suffix = get_current_suffix(ctx)
     if suffix then
       incr_counter(count_key .. ":" .. suffix)
+    end
+
+    local route_match_cached = ctx.route_match_cached
+
+    if route_match_cached then
+      incr_counter(count_key .. ":" .. ROUTE_CACHE_HITS_KEY .. ":" .. route_match_cached)
     end
   end,
 

@@ -86,11 +86,16 @@ local migrations_utils = require "kong.cmd.utils.migrations"
 local plugin_servers = require "kong.runloop.plugin_servers"
 local lmdb_txn = require "resty.lmdb.transaction"
 local instrumentation = require "kong.tracing.instrumentation"
+local tablepool = require "tablepool"
+local table_new = require "table.new"
+local utils = require "kong.tools.utils"
+local constants = require "kong.constants"
+local get_ctx_table = require("resty.core.ctx").get_ctx_table
+
 
 local kong             = kong
 local ngx              = ngx
 local now              = ngx.now
-local update_time      = ngx.update_time
 local var              = ngx.var
 local arg              = ngx.arg
 local header           = ngx.header
@@ -105,30 +110,35 @@ local ngx_DEBUG        = ngx.DEBUG
 local is_http_module   = ngx.config.subsystem == "http"
 local is_stream_module = ngx.config.subsystem == "stream"
 local start_time       = ngx.req.start_time
+local worker_id        = ngx.worker.id
 local type             = type
 local error            = error
 local ipairs           = ipairs
 local assert           = assert
 local tostring         = tostring
 local coroutine        = coroutine
+local fetch_table      = tablepool.fetch
+local release_table    = tablepool.release
 local get_last_failure = ngx_balancer.get_last_failure
 local set_current_peer = ngx_balancer.set_current_peer
 local set_timeouts     = ngx_balancer.set_timeouts
 local set_more_tries   = ngx_balancer.set_more_tries
 local enable_keepalive = ngx_balancer.enable_keepalive
-if not enable_keepalive then
-  ngx_log(ngx_WARN, "missing method 'ngx_balancer.enable_keepalive()' ",
-                    "(was the dyn_upstream_keepalive patch applied?) ",
-                    "set the 'nginx_upstream_keepalive' configuration ",
-                    "property instead of 'upstream_keepalive_pool_size'")
-end
+local time_ns          = utils.time_ns
+local get_updated_now_ms = utils.get_updated_now_ms
 
 
 local DECLARATIVE_LOAD_KEY = constants.DECLARATIVE_LOAD_KEY
 
 
+local CTX_NS = "ctx"
+local CTX_NARR = 0
+local CTX_NREC = 50 -- normally Kong has ~32 keys in ctx
+
+
 local declarative_entities
 local declarative_meta
+local declarative_hash
 local schema_state
 
 
@@ -173,10 +183,32 @@ do
 end
 
 
+local is_data_plane
+local is_control_plane
+local is_dbless
+do
+  is_data_plane = function(config)
+    return config.role == "data_plane"
+  end
+
+
+  is_control_plane = function(config)
+    return config.role == "control_plane"
+  end
+
+
+  is_dbless = function(config)
+    return config.database == "off"
+  end
+end
+
+
 local reset_kong_shm
 do
   local preserve_keys = {
     "kong:node_id",
+    constants.DYN_LOG_LEVEL_KEY,
+    constants.DYN_LOG_LEVEL_TIMEOUT_AT_KEY,
     "events:requests",
     "events:requests:http",
     "events:requests:https",
@@ -194,11 +226,10 @@ do
 
   reset_kong_shm = function(config)
     local kong_shm = ngx.shared.kong
-    local dbless = config.database == "off"
 
     local preserved = {}
 
-    if dbless then
+    if is_dbless(config) then
       if not (config.declarative_config or config.declarative_config_string) then
         preserved[DECLARATIVE_LOAD_KEY] = kong_shm:get(DECLARATIVE_LOAD_KEY)
       end
@@ -217,13 +248,14 @@ do
 end
 
 
-local function setup_plugin_context(ctx, plugin)
+local function setup_plugin_context(ctx, plugin, conf)
   if plugin.handler._go then
     ctx.ran_go_plugin = true
   end
 
   kong_global.set_named_ctx(kong, "plugin", plugin.handler, ctx)
   kong_global.set_namespaced_log(kong, plugin.name, ctx)
+  ctx.plugin_id = conf.__plugin_id
 end
 
 
@@ -237,9 +269,14 @@ end
 
 
 local function execute_init_worker_plugins_iterator(plugins_iterator, ctx)
+  local iterator, plugins = plugins_iterator:get_init_worker_iterator()
+  if not iterator then
+    return
+  end
+
   local errors
 
-  for plugin in plugins_iterator:iterate_init_worker() do
+  for _, plugin in iterator, plugins, 0 do
     kong_global.set_namespaced_log(kong, plugin.name, ctx)
 
     -- guard against failed handler in "init_worker" phase only because it will
@@ -260,18 +297,57 @@ local function execute_init_worker_plugins_iterator(plugins_iterator, ctx)
 end
 
 
-local function execute_access_plugins_iterator(plugins_iterator, ctx)
+local function execute_global_plugins_iterator(plugins_iterator, phase, ctx)
+  if not plugins_iterator.has_plugins then
+    return
+  end
+
+  local iterator, plugins = plugins_iterator:get_global_iterator(phase)
+  if not iterator then
+    return
+  end
+
   local old_ws = ctx.workspace
+  for _, plugin, configuration in iterator, plugins, 0 do
+    local span
+    if phase == "rewrite" then
+      span = instrumentation.plugin_rewrite(plugin)
+    end
+
+    setup_plugin_context(ctx, plugin, configuration)
+    plugin.handler[phase](plugin.handler, configuration)
+    reset_plugin_context(ctx, old_ws)
+
+    if span then
+      span:finish()
+    end
+  end
+end
+
+
+local function execute_collecting_plugins_iterator(plugins_iterator, phase, ctx)
+  if not plugins_iterator.has_plugins then
+    return
+  end
+
+  local iterator, plugins = plugins_iterator:get_collecting_iterator(ctx)
+  if not iterator then
+    return
+  end
 
   ctx.delay_response = true
 
-  for plugin, configuration in plugins_iterator:iterate("access", ctx) do
+  local old_ws = ctx.workspace
+  for _, plugin, configuration in iterator, plugins, 0 do
     if not ctx.delayed_response then
-      local span = instrumentation.plugin_access(plugin)
+      local span
+      if phase == "access" then
+        span = instrumentation.plugin_access(plugin)
+      end
 
-      setup_plugin_context(ctx, plugin)
+      setup_plugin_context(ctx, plugin, configuration)
 
-      local co = coroutine.create(plugin.handler.access)
+      local co = coroutine.create(plugin.handler[phase])
       local cok, cerr = coroutine.resume(co, plugin.handler, configuration)
       if not cok then
         -- set tracing error
@@ -303,17 +379,24 @@ local function execute_access_plugins_iterator(plugins_iterator, ctx)
 end
 
 
-local function execute_plugins_iterator(plugins_iterator, phase, ctx)
+local function execute_collected_plugins_iterator(plugins_iterator, phase, ctx)
+  if not plugins_iterator.has_plugins then
+    return
+  end
+
+  local iterator, plugins = plugins_iterator:get_collected_iterator(phase, ctx)
+  if not iterator then
+    return
+  end
+
   local old_ws = ctx.workspace
-  for plugin, configuration in plugins_iterator:iterate(phase, ctx) do
+  for _, plugin, configuration in iterator, plugins, 0 do
     local span
-    if phase == "rewrite" then
-      span = instrumentation.plugin_rewrite(plugin)
-    elseif phase == "header_filter" then
+    if phase == "header_filter" then
       span = instrumentation.plugin_header_filter(plugin)
     end
 
-    setup_plugin_context(ctx, plugin)
+    setup_plugin_context(ctx, plugin, configuration)
     plugin.handler[phase](plugin.handler, configuration)
     reset_plugin_context(ctx, old_ws)
 
@@ -324,22 +407,12 @@ local function execute_plugins_iterator(plugins_iterator, phase, ctx)
 end
 
 
-local function execute_collected_plugins_iterator(plugins_iterator, phase, ctx)
-  local old_ws = ctx.workspace
-  for plugin, configuration in plugins_iterator.iterate_collected_plugins(phase, ctx) do
-    setup_plugin_context(ctx, plugin)
-    plugin.handler[phase](plugin.handler, configuration)
-    reset_plugin_context(ctx, old_ws)
-  end
-end
-
-
 local function execute_cache_warmup(kong_config)
-  if kong_config.database == "off" then
+  if is_dbless(kong_config) then
     return true
   end
 
-  if ngx.worker.id() == 0 then
+  if worker_id() == 0 then
     local ok, err = cache_warmup.execute(kong_config.db_cache_warmup_entities)
     if not ok then
       return nil, err
@@ -347,12 +420,6 @@ local function execute_cache_warmup(kong_config)
   end
 
   return true
-end
-
-
-local function get_updated_now_ms()
-  update_time()
-  return now() * 1000 -- time is kept in seconds with millisecond resolution.
 end
 
 
@@ -365,45 +432,52 @@ local function flush_delayed_response(ctx)
     return -- avoid tail call
   end
 
-  kong.response.exit(ctx.delayed_response.status_code,
-                     ctx.delayed_response.content,
-                     ctx.delayed_response.headers)
+  local dr = ctx.delayed_response
+  local message = dr.content and dr.content.message or dr.content
+  kong.response.error(dr.status_code, message, dr.headers)
 end
 
 
 local function has_declarative_config(kong_config)
-  return kong_config.declarative_config or kong_config.declarative_config_string
+  local declarative_config = kong_config.declarative_config
+  local declarative_config_string = kong_config.declarative_config_string
+
+  return declarative_config or declarative_config_string,
+         declarative_config ~= nil,         -- is filename
+         declarative_config_string ~= nil   -- is string
 end
 
 
-local function parse_declarative_config(kong_config)
-  local dc = declarative.new_config(kong_config)
+local function parse_declarative_config(kong_config, dc)
+  local declarative_config, is_file, is_string = has_declarative_config(kong_config)
 
-  if not has_declarative_config(kong_config) then
+  local entities, err, _, meta, hash
+  if not declarative_config then
     -- return an empty configuration,
     -- including only the default workspace
-    local entities, _, _, meta = dc:parse_table({ _format_version = "2.1" })
-    return entities, nil, meta
+    entities, _, _, meta, hash = dc:parse_table({ _format_version = "3.0" })
+    return entities, nil, meta, hash
   end
 
-  local entities, err, _, meta
-  if kong_config.declarative_config ~= nil then
-    entities, err, _, meta = dc:parse_file(kong_config.declarative_config)
-  elseif kong_config.declarative_config_string ~= nil then
-    entities, err, _, meta = dc:parse_string(kong_config.declarative_config_string)
+  if is_file then
+    entities, err, _, meta, hash = dc:parse_file(declarative_config)
+
+  elseif is_string then
+    entities, err, _, meta, hash = dc:parse_string(declarative_config)
   end
 
   if not entities then
-    if kong_config.declarative_config ~= nil then
+    if is_file then
       return nil, "error parsing declarative config file " ..
-                  kong_config.declarative_config .. ":\n" .. err
-    elseif kong_config.declarative_config_string ~= nil then
+                  declarative_config .. ":\n" .. err
+
+    elseif is_string then
       return nil, "error parsing declarative string " ..
-                  kong_config.declarative_config_string .. ":\n" .. err
+                  declarative_config .. ":\n" .. err
     end
   end
 
-  return entities, nil, meta
+  return entities, nil, meta, hash
 end
 
 
@@ -425,7 +499,7 @@ local function declarative_init_build()
 end
 
 
-local function load_declarative_config(kong_config, entities, meta)
+local function load_declarative_config(kong_config, entities, meta, hash)
   local opts = {
     name = "declarative_config",
   }
@@ -436,8 +510,7 @@ local function load_declarative_config(kong_config, entities, meta)
     if value then
       return true
     end
-
-    local ok, err = declarative.load_into_cache(entities, meta)
+    local ok, err = declarative.load_into_cache(entities, meta, hash)
     if not ok then
       return nil, err
     end
@@ -535,7 +608,7 @@ function Kong.init()
     certificate.init()
   end
 
-  if is_http_module and (config.role == "data_plane" or config.role == "control_plane")
+  if is_http_module and (is_data_plane(config) or is_control_plane(config))
   then
     kong.clustering = require("kong.clustering").new(config)
   end
@@ -549,14 +622,23 @@ function Kong.init()
     stream_api.load_handlers()
   end
 
-  if config.database == "off" then
+  if is_dbless(config) then
+    local dc, err = declarative.new_config(config)
+    if not dc then
+      error(err)
+    end
+
+    kong.db.declarative_config = dc
+
+
     if is_http_module or
        (#config.proxy_listeners == 0 and
         #config.admin_listeners == 0 and
         #config.status_listeners == 0)
     then
-      local err
-      declarative_entities, err, declarative_meta = parse_declarative_config(kong.configuration)
+      declarative_entities, err, declarative_meta, declarative_hash =
+        parse_declarative_config(kong.configuration, dc)
+
       if not declarative_entities then
         error(err)
       end
@@ -571,8 +653,14 @@ function Kong.init()
       error("error building initial plugins: " .. tostring(err))
     end
 
-    if config.role ~= "control_plane" then
+    if not is_control_plane(config) then
       assert(runloop.build_router("init"))
+
+      ok, err = runloop.set_init_versions_in_cache()
+      if not ok then
+        error("error setting initial versions for router and plugins iterator in cache: " ..
+              tostring(err))
+      end
     end
   end
 
@@ -593,6 +681,13 @@ function Kong.init_worker()
   math.randomseed()
 
 
+  -- setup timerng to _G.kong
+  kong.timer = _G.timerng
+  _G.timerng = nil
+
+  kong.timer:set_debug(kong.configuration.log_level == "debug")
+  kong.timer:start()
+
   -- init DB
 
   local ok, err = kong.db:init_worker()
@@ -601,7 +696,7 @@ function Kong.init_worker()
     return
   end
 
-  if ngx.worker.id() == 0 then
+  if worker_id() == 0 then
     if schema_state.missing_migrations then
       ngx_log(ngx_WARN, "missing migrations: ",
               list_migrations(schema_state.missing_migrations))
@@ -645,15 +740,11 @@ function Kong.init_worker()
   end
   kong.core_cache = core_cache
 
-  ok, err = runloop.set_init_versions_in_cache()
-  if not ok then
-    stash_init_worker_error(err) -- 'err' fully formatted
-    return
-  end
-
   kong.db:set_events_handler(worker_events)
 
-  if kong.configuration.database == "off" then
+  kong.vault.init_worker()
+
+  if is_dbless(kong.configuration) then
     -- databases in LMDB need to be explicitly created, otherwise `get`
     -- operations will return error instead of `nil`. This ensures the default
     -- namespace always exists in the
@@ -675,10 +766,12 @@ function Kong.init_worker()
         stash_init_worker_error("failed to initialize declarative config: " .. err)
         return
       end
+
     elseif declarative_entities then
       ok, err = load_declarative_config(kong.configuration,
                                         declarative_entities,
-                                        declarative_meta)
+                                        declarative_meta,
+                                        declarative_hash)
       if not ok then
         stash_init_worker_error("failed to load declarative config file: " .. err)
         return
@@ -695,22 +788,31 @@ function Kong.init_worker()
     end
   end
 
-  if kong.configuration.role ~= "control_plane" then
+  local is_not_control_plane = not is_control_plane(kong.configuration)
+  if is_not_control_plane then
     ok, err = execute_cache_warmup(kong.configuration)
     if not ok then
       ngx_log(ngx_ERR, "failed to warm up the DB cache: " .. err)
     end
   end
 
-  runloop.init_worker.before()
-
-  -- run plugins init_worker context
   ok, err = runloop.update_plugins_iterator()
   if not ok then
     stash_init_worker_error("failed to build the plugins iterator: " .. err)
     return
   end
 
+  if is_not_control_plane then
+    ok, err = runloop.update_router()
+    if not ok then
+      stash_init_worker_error("failed to build the router: " .. err)
+      return
+    end
+  end
+
+  runloop.init_worker.before()
+
+  -- run plugins init_worker context
   local plugins_iterator = runloop.get_plugins_iterator()
   local errors = execute_init_worker_plugins_iterator(plugins_iterator, ctx)
   if errors then
@@ -721,9 +823,7 @@ function Kong.init_worker()
     end
   end
 
-  runloop.init_worker.after()
-
-  if kong.configuration.role ~= "control_plane" then
+  if is_not_control_plane then
     plugin_servers.start()
   end
 
@@ -733,9 +833,16 @@ function Kong.init_worker()
 end
 
 
+function Kong.exit_worker()
+  if not is_control_plane(kong.configuration) then
+    plugin_servers.stop()
+  end
+end
+
+
 function Kong.ssl_certificate()
   -- Note: ctx here is for a connection (not for a single request)
-  local ctx = ngx.ctx
+  local ctx = get_ctx_table(fetch_table(CTX_NS, CTX_NARR, CTX_NREC))
 
   ctx.KONG_PHASE = PHASES.certificate
 
@@ -744,10 +851,9 @@ function Kong.ssl_certificate()
   -- this is the first phase to run on an HTTPS request
   ctx.workspace = kong.default_workspace
 
-  runloop.certificate.before(ctx)
+  certificate.execute()
   local plugins_iterator = runloop.get_updated_plugins_iterator()
-  execute_plugins_iterator(plugins_iterator, "certificate", ctx)
-  runloop.certificate.after(ctx)
+  execute_global_plugins_iterator(plugins_iterator, "certificate", ctx)
 
   -- TODO: do we want to keep connection context?
   kong.table.clear(ngx.ctx)
@@ -755,7 +861,7 @@ end
 
 
 function Kong.preread()
-  local ctx = ngx.ctx
+  local ctx = get_ctx_table(fetch_table(CTX_NS, CTX_NARR, CTX_NREC))
   if not ctx.KONG_PROCESSING_START then
     ctx.KONG_PROCESSING_START = start_time() * 1000
   end
@@ -777,7 +883,17 @@ function Kong.preread()
   end
 
   local plugins_iterator = runloop.get_updated_plugins_iterator()
-  execute_plugins_iterator(plugins_iterator, "preread", ctx)
+  execute_collecting_plugins_iterator(plugins_iterator, "preread", ctx)
+
+  if ctx.delayed_response then
+    ctx.KONG_PREREAD_ENDED_AT = get_updated_now_ms()
+    ctx.KONG_PREREAD_TIME = ctx.KONG_PREREAD_ENDED_AT - ctx.KONG_PREREAD_START
+    ctx.KONG_RESPONSE_LATENCY = ctx.KONG_PREREAD_ENDED_AT - ctx.KONG_PROCESSING_START
+
+    return flush_delayed_response(ctx)
+  end
+
+  ctx.delay_response = nil
 
   if not ctx.service then
     ctx.KONG_PREREAD_ENDED_AT = get_updated_now_ms()
@@ -811,7 +927,14 @@ function Kong.rewrite()
     return
   end
 
-  local ctx = ngx.ctx
+  local is_https = var.https == "on"
+  local ctx
+  if is_https then
+    ctx = ngx.ctx
+  else
+    ctx = get_ctx_table(fetch_table(CTX_NS, CTX_NARR, CTX_NREC))
+  end
+
   if not ctx.KONG_PROCESSING_START then
     ctx.KONG_PROCESSING_START = start_time() * 1000
   end
@@ -824,7 +947,6 @@ function Kong.rewrite()
 
   kong_resty_ctx.stash_ref(ctx)
 
-  local is_https = var.https == "on"
   if not is_https then
     log_init_worker_errors(ctx)
   end
@@ -843,9 +965,7 @@ function Kong.rewrite()
     plugins_iterator = runloop.get_updated_plugins_iterator()
   end
 
-  execute_plugins_iterator(plugins_iterator, "rewrite", ctx)
-
-  runloop.rewrite.after(ctx)
+  execute_global_plugins_iterator(plugins_iterator, "rewrite", ctx)
 
   ctx.KONG_REWRITE_ENDED_AT = get_updated_now_ms()
   ctx.KONG_REWRITE_TIME = ctx.KONG_REWRITE_ENDED_AT - ctx.KONG_REWRITE_START
@@ -869,7 +989,7 @@ function Kong.access()
 
   local plugins_iterator = runloop.get_plugins_iterator()
 
-  execute_access_plugins_iterator(plugins_iterator, ctx)
+  execute_collecting_plugins_iterator(plugins_iterator, "access", ctx)
 
   if ctx.delayed_response then
     ctx.KONG_ACCESS_ENDED_AT = get_updated_now_ms()
@@ -888,7 +1008,7 @@ function Kong.access()
 
     ctx.buffered_proxying = nil
 
-    return kong.response.exit(503, { message = "no Service found with those values"})
+    return kong.response.error(503, "no Service found with those values")
   end
 
   runloop.access.after(ctx)
@@ -921,6 +1041,7 @@ end
 function Kong.balancer()
   -- This may be called multiple times, and no yielding here!
   local now_ms = now() * 1000
+  local now_ns = time_ns()
 
   local ctx = ngx.ctx
   if not ctx.KONG_BALANCER_START then
@@ -953,19 +1074,23 @@ function Kong.balancer()
 
   local balancer_data = ctx.balancer_data
   local tries = balancer_data.tries
-  local current_try = {}
-  balancer_data.try_count = balancer_data.try_count + 1
-  tries[balancer_data.try_count] = current_try
+  local try_count = balancer_data.try_count
+  local current_try = table_new(0, 4)
+
+  try_count = try_count + 1
+  balancer_data.try_count = try_count
+  tries[try_count] = current_try
 
   current_try.balancer_start = now_ms
+  current_try.balancer_start_ns = now_ns
 
-  if balancer_data.try_count > 1 then
+  if try_count > 1 then
     -- only call balancer on retry, first one is done in `runloop.access.after`
     -- which runs in the ACCESS context and hence has less limitations than
     -- this BALANCER context where the retries are executed
 
     -- record failure data
-    local previous_try = tries[balancer_data.try_count - 1]
+    local previous_try = tries[try_count - 1]
     previous_try.state, previous_try.code = get_last_failure()
 
     -- Report HTTP status for health checks
@@ -1014,9 +1139,11 @@ function Kong.balancer()
 
   local pool_opts
   local kong_conf = kong.configuration
+  local balancer_data_ip = balancer_data.ip
+  local balancer_data_port = balancer_data.port
 
-  if enable_keepalive and kong_conf.upstream_keepalive_pool_size > 0 and is_http_module then
-    local pool = balancer_data.ip .. "|" .. balancer_data.port
+  if kong_conf.upstream_keepalive_pool_size > 0 and is_http_module then
+    local pool = balancer_data_ip .. "|" .. balancer_data_port
 
     if balancer_data.scheme == "https" then
       -- upstream_host is SNI
@@ -1033,16 +1160,16 @@ function Kong.balancer()
     }
   end
 
-  current_try.ip   = balancer_data.ip
-  current_try.port = balancer_data.port
+  current_try.ip   = balancer_data_ip
+  current_try.port = balancer_data_port
 
   -- set the targets as resolved
-  ngx_log(ngx_DEBUG, "setting address (try ", balancer_data.try_count, "): ",
-                     balancer_data.ip, ":", balancer_data.port)
-  local ok, err = set_current_peer(balancer_data.ip, balancer_data.port, pool_opts)
+  ngx_log(ngx_DEBUG, "setting address (try ", try_count, "): ",
+                     balancer_data_ip, ":", balancer_data_port)
+  local ok, err = set_current_peer(balancer_data_ip, balancer_data_port, pool_opts)
   if not ok then
     ngx_log(ngx_ERR, "failed to set the current peer (address: ",
-            tostring(balancer_data.ip), " port: ", tostring(balancer_data.port),
+            tostring(balancer_data_ip), " port: ", tostring(balancer_data_port),
             "): ", tostring(err))
 
     ctx.KONG_BALANCER_ENDED_AT = get_updated_now_ms()
@@ -1079,6 +1206,7 @@ function Kong.balancer()
   -- record try-latency
   local try_latency = ctx.KONG_BALANCER_ENDED_AT - current_try.balancer_start
   current_try.balancer_latency = try_latency
+  current_try.balancer_latency_ns = time_ns() - current_try.balancer_start_ns
 
   -- time spent in Kong before sending the request to upstream
   -- start_time() is kept in seconds with millisecond resolution.
@@ -1157,12 +1285,16 @@ do
       ctx.KONG_PROXY_LATENCY = ctx.KONG_RESPONSE_START - ctx.KONG_PROCESSING_START
     end
 
+    if not ctx.KONG_UPSTREAM_DNS_TIME and ctx.KONG_UPSTREAM_DNS_END_AT and ctx.KONG_UPSTREAM_DNS_START then
+      ctx.KONG_UPSTREAM_DNS_TIME = ctx.KONG_UPSTREAM_DNS_END_AT - ctx.KONG_UPSTREAM_DNS_START
+    else
+      ctx.KONG_UPSTREAM_DNS_TIME = 0
+    end
+
     kong.response.set_status(status)
     kong.response.set_headers(headers)
 
-    runloop.response.before(ctx)
     execute_collected_plugins_iterator(plugins_iterator, "response", ctx)
-    runloop.response.after(ctx)
 
     ctx.KONG_RESPONSE_ENDED_AT = get_updated_now_ms()
     ctx.KONG_RESPONSE_TIME = ctx.KONG_RESPONSE_ENDED_AT - ctx.KONG_RESPONSE_START
@@ -1308,6 +1440,7 @@ function Kong.body_filter()
   end
 
   ctx.KONG_BODY_FILTER_ENDED_AT = get_updated_now_ms()
+  ctx.KONG_BODY_FILTER_ENDED_AT_NS = time_ns()
   ctx.KONG_BODY_FILTER_TIME = ctx.KONG_BODY_FILTER_ENDED_AT - ctx.KONG_BODY_FILTER_START
 
   if ctx.KONG_PROXIED then
@@ -1411,8 +1544,10 @@ function Kong.log()
   runloop.log.before(ctx)
   local plugins_iterator = runloop.get_plugins_iterator()
   execute_collected_plugins_iterator(plugins_iterator, "log", ctx)
+  plugins_iterator.release(ctx)
   runloop.log.after(ctx)
 
+  release_table(CTX_NS, ctx)
 
   -- this is not used for now, but perhaps we need it later?
   --ctx.KONG_LOG_ENDED_AT = get_now_ms()
@@ -1427,16 +1562,7 @@ function Kong.handle_error()
   ctx.KONG_PHASE = PHASES.error
   ctx.KONG_UNEXPECTED = true
 
-  local old_ws = ctx.workspace
   log_init_worker_errors(ctx)
-
-  if not ctx.plugins then
-    local plugins_iterator = runloop.get_updated_plugins_iterator()
-    for _ in plugins_iterator:iterate("content", ctx) do
-      -- just build list of plugins
-      ctx.workspace = old_ws
-    end
-  end
 
   return kong_error_handlers(ctx)
 end
@@ -1531,26 +1657,14 @@ function Kong.serve_cluster_listener(options)
 end
 
 
-function Kong.serve_wrpc_listener(options)
-  log_init_worker_errors()
-
-  ngx.ctx.KONG_PHASE = PHASES.cluster_listener
-
-  return kong.clustering:handle_wrpc_websocket()
-end
-
-
-function Kong.serve_version_handshake()
-  return kong.clustering:serve_version_handshake()
-end
-
-
 function Kong.stream_api()
   stream_api.handle()
 end
 
 
 do
+  local cjson = require "cjson.safe"
+
   function Kong.stream_config_listener()
     local sock, err = ngx.req.socket()
     if not sock then
@@ -1560,16 +1674,19 @@ do
 
     local data, err = sock:receive("*a")
     if not data then
-      ngx_log(ngx_CRIT, "unable to receive new config: ", err)
+      ngx_log(ngx_CRIT, "unable to receive reconfigure data: ", err)
       return
     end
 
-    kong.core_cache:purge()
-    kong.cache:purge()
+    local reconfigure_data, err = cjson.decode(data)
+    if not reconfigure_data then
+      ngx_log(ngx_ERR, "failed to json decode reconfigure data: ", err)
+      return
+    end
 
-    local ok, err = kong.worker_events.post("declarative", "reconfigure", data)
+    local ok, err = kong.worker_events.post("declarative", "reconfigure", reconfigure_data)
     if ok ~= "done" then
-      ngx_log(ngx_ERR, "failed to reboadcast reconfigure event in stream: ", err or ok)
+      ngx_log(ngx_ERR, "failed to rebroadcast reconfigure event in stream: ", err or ok)
     end
   end
 end

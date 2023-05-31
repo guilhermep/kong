@@ -303,12 +303,6 @@ for _, strategy in helpers.each_strategy() do
             assert.is_string(offset)
 
             local page_size = 5
-            if strategy == "cassandra" then
-              -- 5 + 1: cassandra only detects the end of a pagination when
-              -- we go past the number of rows in the iteration - it doesn't
-              -- seem to detect the pages ending at the limit
-              page_size = page_size + 1
-            end
 
             local rows_2, err, err_t, offset = db.routes:page(page_size, offset)
             assert.is_nil(err_t)
@@ -520,7 +514,7 @@ for _, strategy in helpers.each_strategy() do
             protocols = { "http" },
             hosts = { "example.com" },
             service = assert(db.services:insert({ host = "service.com" })),
-            path_handling = "v1",
+            path_handling = "v0",
           }, { nulls = true, workspace = "8a139c70-49a1-4ba2-98a6-bb36f534269d", })
           assert.is_nil(route)
           assert.is_string(err)
@@ -685,7 +679,7 @@ for _, strategy in helpers.each_strategy() do
             protocols = { "http" },
             hosts = { "example.com" },
             service = assert(db.services:insert({ host = "service.com" })),
-            path_handling = "v1",
+            path_handling = "v0",
           }, { nulls = true })
           assert.is_nil(err_t)
           assert.is_nil(err)
@@ -711,7 +705,7 @@ for _, strategy in helpers.each_strategy() do
             regex_priority  = 0,
             preserve_host   = false,
             strip_path      = true,
-            path_handling   = "v1",
+            path_handling   = "v0",
             tags            = ngx.null,
             service         = route.service,
             https_redirect_status_code = 426,
@@ -728,7 +722,7 @@ for _, strategy in helpers.each_strategy() do
             paths           = { "/example" },
             regex_priority  = 3,
             strip_path      = true,
-            path_handling   = "v1",
+            path_handling   = "v0",
             service         = bp.services:insert(),
           }, { nulls = true })
           assert.is_nil(err_t)
@@ -754,7 +748,7 @@ for _, strategy in helpers.each_strategy() do
             destinations    = ngx.null,
             regex_priority  = 3,
             strip_path      = true,
-            path_handling   = "v1",
+            path_handling   = "v0",
             tags            = ngx.null,
             preserve_host   = false,
             service         = route.service,
@@ -771,7 +765,7 @@ for _, strategy in helpers.each_strategy() do
             paths           = { "/example" },
             regex_priority  = 3,
             strip_path      = true,
-            path_handling   = "v1",
+            path_handling   = "v0",
           }, { nulls = true })
           assert.is_nil(err_t)
           assert.is_nil(err)
@@ -797,7 +791,7 @@ for _, strategy in helpers.each_strategy() do
             tags            = ngx.null,
             regex_priority  = 3,
             strip_path      = true,
-            path_handling   = "v1",
+            path_handling   = "v0",
             preserve_host   = false,
             service         = ngx.null,
             https_redirect_status_code = 426,
@@ -1102,7 +1096,7 @@ for _, strategy in helpers.each_strategy() do
             protocols = { "https" },
             hosts = { "example.com" },
             regex_priority = 5,
-            path_handling = "v1"
+            path_handling = "v0"
           })
           assert.is_nil(err_t)
           assert.is_nil(err)
@@ -1116,7 +1110,7 @@ for _, strategy in helpers.each_strategy() do
             paths           = route.paths,
             regex_priority  = 5,
             strip_path      = route.strip_path,
-            path_handling   = "v1",
+            path_handling   = "v0",
             preserve_host   = route.preserve_host,
             tags            = route.tags,
             service         = route.service,
@@ -1131,11 +1125,11 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         describe("unsetting with ngx.null", function()
-          it("succeeds if all routing criteria explicitely given are null", function()
+          it("succeeds if all routing criteria explicitly given are null", function()
             local route = bp.routes:insert({
               hosts   = { "example.com" },
               methods = { "GET" },
-              path_handling = "v1",
+              path_handling = "v0",
             })
 
             local new_route, err, err_t = db.routes:update({ id = route.id }, {
@@ -1151,7 +1145,7 @@ for _, strategy in helpers.each_strategy() do
               hosts           = route.hosts,
               regex_priority  = route.regex_priority,
               strip_path      = route.strip_path,
-              path_handling   = "v1",
+              path_handling   = "v0",
               preserve_host   = route.preserve_host,
               tags            = route.tags,
               service         = route.service,
@@ -1539,7 +1533,7 @@ for _, strategy in helpers.each_strategy() do
           }, err_t)
         end)
 
-        it("cannot create assign ca_certificates when protocol is not https", function()
+        it("cannot create assign ca_certificates when protocol is not https or tls", function()
           -- insert 2
           local service, _, err_t = db.services:insert {
             name = "cc_test",
@@ -1560,7 +1554,7 @@ for _, strategy in helpers.each_strategy() do
           }, err_t)
         end)
 
-        it("cannot create assign tls_verify when protocol is not https", function()
+        it("cannot create assign tls_verify when protocol is not https or tls", function()
           -- insert 2
           local service, _, err_t = db.services:insert {
             name = "cc_test",
@@ -1581,7 +1575,7 @@ for _, strategy in helpers.each_strategy() do
           }, err_t)
         end)
 
-        it("cannot create assign tls_verify_depth when protocol is not https", function()
+        it("cannot create assign tls_verify_depth when protocol is not https or tls", function()
           -- insert 2
           local service, _, err_t = db.services:insert {
             name = "cc_test",
@@ -1978,7 +1972,7 @@ for _, strategy in helpers.each_strategy() do
           protocols = { "http" },
           hosts     = { "example.com" },
           service   = service,
-          path_handling = "v1",
+          path_handling = "v0",
         }, { nulls = true })
         assert.is_nil(err_t)
         assert.is_nil(err)
@@ -1997,7 +1991,7 @@ for _, strategy in helpers.each_strategy() do
           destinations     = ngx.null,
           regex_priority   = 0,
           strip_path       = true,
-          path_handling    = "v1",
+          path_handling    = "v0",
           preserve_host    = false,
           tags             = ngx.null,
           service          = {
@@ -2318,12 +2312,6 @@ for _, strategy in helpers.each_strategy() do
               assert.is_string(offset)
 
               local page_size = 5
-              if strategy == "cassandra" then
-                -- 5 + 1: cassandra only detects the end of a pagination when
-                -- we go past the number of rows in the iteration - it doesn't
-                -- seem to detect the pages ending at the limit
-                page_size = page_size + 1
-              end
 
               local rows_2, err, err_t, offset = db.routes:page_for_service({
                 id = service.id,

@@ -1,4 +1,5 @@
 local helpers   = require "spec.helpers"
+local http_mock = require "spec.helpers.http_mock"
 local cjson     = require "cjson"
 
 
@@ -239,6 +240,84 @@ for _, strategy in helpers.each_strategy() do
         }, "/proxy-authorization")
 
         assert.equal("Basic ZGVtbzp0ZXN0", headers["proxy-authorization"])
+      end)
+    end)
+
+    describe("(response from upstream)", function()
+      local mock
+      lazy_setup(function()
+        assert(db:truncate("routes"))
+        assert(db:truncate("services"))
+        local port = helpers.get_available_port()
+        mock = http_mock.new("localhost:" .. port, {
+          ["/nocharset"] = {
+            content = [[
+              ngx.header.content_type = "text/plain"
+              ngx.say("Hello World!")
+            ]]
+          },
+          ["/charset"] = {
+            content = [[
+              ngx.header.content_type = "text/plain; charset=utf-8"
+              ngx.say("Hello World!")
+            ]]
+          }
+        }, {
+          record_opts = {
+            req = false,
+          }
+        })
+
+        assert(mock:start())
+
+        local service = assert(bp.services:insert {
+          protocol = "http",
+          host = "127.0.0.1",
+          port = port,
+        })
+
+        assert(bp.routes:insert {
+          hosts = { "headers-charset.com" },
+          service = service,
+        })
+
+        assert(helpers.start_kong({
+          database           = strategy,
+          nginx_http_charset = "off",
+        }))
+      end)
+
+      lazy_teardown(function()
+        stop_kong()
+        mock:stop()
+      end)
+
+      describe("Content-Type", function()
+        it("does not add charset if the response from upstream contains no charset when charset is turned off", function()
+          local res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/nocharset",
+            headers = {
+              ["Host"] = "headers-charset.com",
+            }
+          })
+
+          assert.res_status(200, res)
+          assert.equal("text/plain", res.headers["Content-Type"])
+        end)
+
+        it("charset remain unchanged if the response from upstream contains charset when charset is turned off", function()
+          local res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/charset",
+            headers = {
+              ["Host"] = "headers-charset.com",
+            }
+          })
+
+          assert.res_status(200, res)
+          assert.equal("text/plain; charset=utf-8", res.headers["Content-Type"])
+        end)
       end)
     end)
 

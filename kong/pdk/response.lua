@@ -28,14 +28,15 @@ local error = error
 local pairs = pairs
 local concat = table.concat
 local coroutine = coroutine
+local cjson_encode = cjson.encode
 local normalize_header = checks.normalize_header
 local normalize_multi_header = checks.normalize_multi_header
 local validate_header = checks.validate_header
 local validate_headers = checks.validate_headers
 local check_phase = phase_checker.check
-local split = utils.split
 local add_header
-if ngx and ngx.config.subsystem == "http" then
+local is_http_subsystem = ngx and ngx.config.subsystem == "http"
+if is_http_subsystem then
   add_header = require("ngx.resp").add_header
 end
 
@@ -62,7 +63,6 @@ local function new(self, major_version)
   local _RESPONSE = {}
 
   local MIN_HEADERS          = 1
-  local MAX_HEADERS_DEFAULT  = 100
   local MAX_HEADERS          = 1000
 
   local MIN_STATUS_CODE      = 100
@@ -116,50 +116,66 @@ local function new(self, major_version)
     [16] = "Unauthenticated",
   }
 
-  local HTTP_MESSAGES = {
-    s400 = "Bad request",
-    s401 = "Unauthorized",
-    s402 = "Payment required",
-    s403 = "Forbidden",
-    s404 = "Not found",
-    s405 = "Method not allowed",
-    s406 = "Not acceptable",
-    s407 = "Proxy authentication required",
-    s408 = "Request timeout",
-    s409 = "Conflict",
-    s410 = "Gone",
-    s411 = "Length required",
-    s412 = "Precondition failed",
-    s413 = "Payload too large",
-    s414 = "URI too long",
-    s415 = "Unsupported media type",
-    s416 = "Range not satisfiable",
-    s417 = "Expectation failed",
-    s418 = "I'm a teapot",
-    s421 = "Misdirected request",
-    s422 = "Unprocessable entity",
-    s423 = "Locked",
-    s424 = "Failed dependency",
-    s425 = "Too early",
-    s426 = "Upgrade required",
-    s428 = "Precondition required",
-    s429 = "Too many requests",
-    s431 = "Request header fields too large",
-    s451 = "Unavailable for legal reasons",
-    s494 = "Request header or cookie too large",
-    s500 = "An unexpected error occurred",
-    s501 = "Not implemented",
-    s502 = "An invalid response was received from the upstream server",
-    s503 = "The upstream server is currently unavailable",
-    s504 = "The upstream server is timing out",
-    s505 = "HTTP version not supported",
-    s506 = "Variant also negotiates",
-    s507 = "Insufficient storage",
-    s508 = "Loop detected",
-    s510 = "Not extended",
-    s511 = "Network authentication required",
-    default = "The upstream server responded with %d"
-  }
+  local get_http_error_message
+  do
+    local HTTP_ERROR_MESSAGES = {
+      [400] = "Bad request",
+      [401] = "Unauthorized",
+      [402] = "Payment required",
+      [403] = "Forbidden",
+      [404] = "Not found",
+      [405] = "Method not allowed",
+      [406] = "Not acceptable",
+      [407] = "Proxy authentication required",
+      [408] = "Request timeout",
+      [409] = "Conflict",
+      [410] = "Gone",
+      [411] = "Length required",
+      [412] = "Precondition failed",
+      [413] = "Payload too large",
+      [414] = "URI too long",
+      [415] = "Unsupported media type",
+      [416] = "Range not satisfiable",
+      [417] = "Expectation failed",
+      [418] = "I'm a teapot",
+      [421] = "Misdirected request",
+      [422] = "Unprocessable entity",
+      [423] = "Locked",
+      [424] = "Failed dependency",
+      [425] = "Too early",
+      [426] = "Upgrade required",
+      [428] = "Precondition required",
+      [429] = "Too many requests",
+      [431] = "Request header fields too large",
+      [451] = "Unavailable for legal reasons",
+      [494] = "Request header or cookie too large",
+      [500] = "An unexpected error occurred",
+      [501] = "Not implemented",
+      [502] = "An invalid response was received from the upstream server",
+      [503] = "The upstream server is currently unavailable",
+      [504] = "The upstream server is timing out",
+      [505] = "HTTP version not supported",
+      [506] = "Variant also negotiates",
+      [507] = "Insufficient storage",
+      [508] = "Loop detected",
+      [510] = "Not extended",
+      [511] = "Network authentication required",
+    }
+
+
+    function get_http_error_message(status)
+      local msg = HTTP_ERROR_MESSAGES[status]
+
+      if msg then
+        return msg
+      end
+
+      msg = fmt("The upstream server responded with %d", status)
+      HTTP_ERROR_MESSAGES[status] = msg
+
+      return msg
+    end
+  end
 
 
   ---
@@ -251,9 +267,10 @@ local function new(self, major_version)
   -- headers as the client would see them upon reception, including headers
   -- added by Kong itself.
   --
-  -- By default, this function returns up to **100** headers. The optional
-  -- `max_headers` argument can be specified to customize this limit, but must
-  -- be greater than **1** and equal to or less than **1000**.
+  -- By default, this function returns up to **100** headers (or what has been
+  -- configured using `lua_max_resp_headers`). The optional `max_headers` argument
+  -- can be specified to customize this limit, but must be greater than **1** and
+  -- equal to or less than **1000**.
   --
   -- @function kong.response.get_headers
   -- @phases header_filter, response, body_filter, log, admin_api
@@ -278,7 +295,7 @@ local function new(self, major_version)
     check_phase(header_body_log)
 
     if max_headers == nil then
-      return ngx.resp.get_headers(MAX_HEADERS_DEFAULT)
+      return ngx.resp.get_headers()
     end
 
     if type(max_headers) ~= "number" then
@@ -723,7 +740,7 @@ local function new(self, major_version)
 
       else
         local err
-        json, err = cjson.encode(body)
+        json, err = cjson_encode(body)
         if err then
           error(fmt("body encoding failed while flushing response: %s", err), 2)
         end
@@ -812,7 +829,34 @@ local function new(self, major_version)
     return send(response.status_code, response.content, response.headers)
   end
 
-  if ngx and ngx.config.subsystem == 'http' then
+
+  local function send_stream(status, body, headers)
+    if body then
+      if status < 400 then
+        -- only sends body to the client for < 400 status code
+        local res, err = ngx.print(body)
+        if not res then
+          error("unable to send body to client: " .. err, 2)
+        end
+
+      else
+        self.log.err("unable to proxy stream connection, " ..
+                     "status: " .. status .. ", err: ", body)
+      end
+    end
+
+    return ngx.exit(status)
+  end
+
+
+  local function flush_stream(ctx)
+    ctx = ctx or ngx.ctx
+    local response = ctx.delayed_response
+    return send_stream(response.status_code, response.content, response.headers)
+  end
+
+
+  if is_http_subsystem then
     ---
     -- This function interrupts the current processing and produces a response.
     -- It is typical to see plugins using it to produce a response before Kong
@@ -983,7 +1027,7 @@ local function new(self, major_version)
       if body ~= nil then
         if type(body) == "table" then
           local err
-          body, err = cjson.encode(body)
+          body, err = cjson_encode(body)
           if err then
             error("invalid body: " .. err, 2)
           end
@@ -994,55 +1038,23 @@ local function new(self, major_version)
         end
       end
 
-      if body then
-        if status < 400 then
-          -- only sends body to the client for 200 status code
-          local res, err = ngx.print(body)
-          if not res then
-            error("unable to send body to client: " .. err, 2)
-          end
+      local ctx = ngx.ctx
+      ctx.KONG_EXITED = true
 
-        else
-          self.log.err("unable to proxy stream connection, " ..
-                       "status: " .. status .. ", err: ", body)
-        end
-      end
+      if ctx.delay_response and not ctx.delayed_response then
+        ctx.delayed_response = {
+          status_code = status,
+          content     = body,
+          headers     = headers,
+        }
 
-      return ngx.exit(status)
-    end
-  end
+        ctx.delayed_response_callback = flush_stream
+        coroutine.yield()
 
-
-  local function get_response_type(content_header)
-    local type = CONTENT_TYPE_JSON
-
-    if content_header ~= nil then
-      local accept_values = split(content_header, ",")
-      local max_quality = 0
-      for _, value in ipairs(accept_values) do
-        local mimetype_values = split(value, ";")
-        local name
-        local quality = 1
-        for _, entry in ipairs(mimetype_values) do
-          local m = ngx.re.match(entry, [[^\s*(\S+\/\S+)\s*$]], "ajo")
-          if m then
-            name = m[1]
-          else
-            m = ngx.re.match(entry, [[^\s*q=([0-9]*[\.][0-9]+)\s*$]], "ajoi")
-            if m then
-              quality = tonumber(m[1])
-            end
-          end
-        end
-
-        if name and quality > max_quality then
-          type = utils.get_mime_type(name)
-          max_quality = quality
-        end
+      else
+        return send_stream(status, body, headers)
       end
     end
-
-    return type
   end
 
 
@@ -1118,7 +1130,7 @@ local function new(self, major_version)
     if message ~= nil then
       if type(message) == "table" then
         local err
-        message, err = cjson.encode(message)
+        message, err = cjson_encode(message)
         if err then
           error("could not JSON encode the error message: " .. err, 2)
         end
@@ -1127,7 +1139,6 @@ local function new(self, major_version)
       if type(message) ~= "string" then
         error("message must be a nil, a string or a table", 2)
       end
-
     end
 
     if headers ~= nil and type(headers) ~= "table" then
@@ -1148,11 +1159,8 @@ local function new(self, major_version)
       if is_grpc_request() then
         content_type = CONTENT_TYPE_GRPC
       else
-        content_type_header = ngx.req.get_headers()[ACCEPT_NAME]
-        if type(content_type_header) == "table" then
-          content_type_header = content_type_header[1]
-        end
-        content_type = get_response_type(content_type_header)
+        local accept_header = ngx.req.get_headers()[ACCEPT_NAME]
+        content_type = utils.get_response_type(accept_header)
       end
     end
 
@@ -1160,9 +1168,7 @@ local function new(self, major_version)
 
     local body
     if content_type ~= CONTENT_TYPE_GRPC then
-      local actual_message = message or
-                             HTTP_MESSAGES["s" .. status] or
-                             fmt(HTTP_MESSAGES.default, status)
+      local actual_message = message or get_http_error_message(status)
       body = fmt(utils.get_error_template(content_type), actual_message)
     end
 

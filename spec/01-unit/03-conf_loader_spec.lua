@@ -55,6 +55,7 @@ describe("Configuration loader", function()
     assert.same({}, conf.admin_ssl_cert_key)
     assert.same({}, conf.status_ssl_cert)
     assert.same({}, conf.status_ssl_cert_key)
+    assert.same(false, conf.allow_debug_header)
     assert.is_nil(getmetatable(conf))
   end)
   it("loads a given file, with higher precedence", function()
@@ -122,12 +123,6 @@ describe("Configuration loader", function()
     assert.same(2, tablex.size(conf.loaded_plugins))
     assert.True(conf.loaded_plugins["foo"])
     assert.True(conf.loaded_plugins["bar"])
-  end)
-  it("apply # transformations when loading from config file directly", function()
-    local conf = assert(conf_loader(nil, {
-      pg_password = "!abCDefGHijKL4\\#1MN2OP3",
-    }))
-    assert.same("!abCDefGHijKL4#1MN2OP3", conf.pg_password)
   end)
   it("no longer applies # transformations when loading from .kong_env (issue #5761)", function()
     local conf = assert(conf_loader(nil, {
@@ -266,7 +261,7 @@ describe("Configuration loader", function()
 
     local conf = assert(conf_loader("spec/fixtures/to-strip.conf"))
 
-    assert.equal("cassandra", conf.database)
+    assert.equal("postgres", conf.database)
     assert.equal("debug", conf.log_level)
   end)
   it("overcomes penlight's list_delim option", function()
@@ -311,26 +306,26 @@ describe("Configuration loader", function()
     }))
     assert.equal("test##12##3#", conf.pg_password)
   end)
-  it("does not modify existing escaped octothorpes in environment variables", function()
+  it("does not modify existing octothorpes in environment variables", function()
     finally(function()
       helpers.unsetenv("KONG_PG_PASSWORD")
     end)
-    helpers.setenv("KONG_PG_PASSWORD", [[test\#123]])
+    helpers.setenv("KONG_PG_PASSWORD", [[test#123]])
     local conf = assert(conf_loader())
     assert.equal("test#123", conf.pg_password)
 
-    helpers.setenv("KONG_PG_PASSWORD", [[test\#\#12\#\#3\#]])
+    helpers.setenv("KONG_PG_PASSWORD", [[test##12##3#]])
     local conf = assert(conf_loader())
     assert.equal("test##12##3#", conf.pg_password)
   end)
-  it("does not modify existing escaped octothorpes in custom_conf overrides", function()
+  it("does not modify existing octothorpes in custom_conf overrides", function()
     local conf = assert(conf_loader(nil, {
-      pg_password = [[test\#123]],
+      pg_password = [[test#123]],
     }))
     assert.equal("test#123", conf.pg_password)
 
     local conf = assert(conf_loader(nil, {
-      pg_password = [[test\#\#12\#\#3\#]],
+      pg_password = [[test##12##3#]],
     }))
     assert.equal("test##12##3#", conf.pg_password)
   end)
@@ -521,6 +516,13 @@ describe("Configuration loader", function()
       })
       assert.equal("invalid port mapping (`port_maps`): src:dst", err)
     end)
+    it("errors with a helpful error message if cassandra is used", function()
+      local _, err = conf_loader(nil, {
+        database = "cassandra"
+      })
+      assert.equal("Cassandra as a datastore for Kong is not supported in" ..
+        " versions 3.4 and above. Please use Postgres.", err)
+    end)
   end)
 
   describe("inferences", function()
@@ -529,42 +531,34 @@ describe("Configuration loader", function()
       assert.equal("on", conf.nginx_main_daemon)
       assert.equal(30, conf.lua_socket_pool_size)
       assert.True(conf.anonymous_reports)
-      assert.False(conf.cassandra_ssl)
-      assert.False(conf.cassandra_ssl_verify)
       assert.False(conf.pg_ssl)
       assert.False(conf.pg_ssl_verify)
 
       conf = assert(conf_loader(nil, {
-        cassandra_ssl = true,
         pg_ssl = true
       }))
-      assert.True(conf.cassandra_ssl)
       assert.True(conf.pg_ssl)
 
       conf = assert(conf_loader(nil, {
-        cassandra_ssl = "on",
         pg_ssl = "on"
       }))
-      assert.True(conf.cassandra_ssl)
       assert.True(conf.pg_ssl)
 
       conf = assert(conf_loader(nil, {
-        cassandra_ssl = "true",
         pg_ssl = "true"
       }))
-      assert.True(conf.cassandra_ssl)
       assert.True(conf.pg_ssl)
     end)
     it("infer arrays (comma-separated strings)", function()
       local conf = assert(conf_loader())
-      assert.same({"127.0.0.1"}, conf.cassandra_contact_points)
-      assert.same({"dc1:2", "dc2:3"}, conf.cassandra_data_centers)
-      assert.is_nil(getmetatable(conf.cassandra_contact_points))
-      assert.is_nil(getmetatable(conf.cassandra_data_centers))
+      assert.same({"bundled"}, conf.plugins)
+      assert.same({"LAST", "SRV", "A", "CNAME"}, conf.dns_order)
+      assert.is_nil(getmetatable(conf.plugins))
+      assert.is_nil(getmetatable(conf.dns_order))
     end)
     it("trims array values", function()
       local conf = assert(conf_loader("spec/fixtures/to-strip.conf"))
-      assert.same({"dc1:2", "dc2:3", "dc3:4"}, conf.cassandra_data_centers)
+      assert.same({"foobar", "hello-world", "bundled"}, conf.plugins)
     end)
     it("infer ngx_boolean", function()
       local conf = assert(conf_loader(nil, {
@@ -604,48 +598,32 @@ describe("Configuration loader", function()
       })
       assert.equal("worker_consistency has an invalid value: 'magical' (strict, eventual)", err)
       assert.is_nil(conf)
-
-      conf, err = conf_loader(nil, {
-        cassandra_write_consistency = "FOUR"
-      })
-      assert.equal("cassandra_write_consistency has an invalid value: 'FOUR'" ..
-                   " (ALL, EACH_QUORUM, QUORUM, LOCAL_QUORUM, ONE, TWO," ..
-                   " THREE, LOCAL_ONE)", err)
-      assert.is_nil(conf)
-
-      conf, err = conf_loader(nil, {
-        cassandra_read_consistency = "FOUR"
-      })
-      assert.equal("cassandra_read_consistency has an invalid value: 'FOUR'" ..
-                   " (ALL, EACH_QUORUM, QUORUM, LOCAL_QUORUM, ONE, TWO," ..
-                   " THREE, LOCAL_ONE)", err)
-      assert.is_nil(conf)
     end)
     it("enforces listen addresses format", function()
       local conf, err = conf_loader(nil, {
         admin_listen = "127.0.0.1"
       })
       assert.is_nil(conf)
-      assert.equal("admin_listen must be of form: [off] | <ip>:<port> [ssl] [http2] [proxy_protocol] [deferred] [bind] [reuseport] [backlog=%d+], [... next entry ...]", err)
+      assert.equal("admin_listen must be of form: [off] | <ip>:<port> [ssl] [http2] [proxy_protocol] [deferred] [bind] [reuseport] [backlog=%d+] [ipv6only=on] [ipv6only=off] [so_keepalive=on] [so_keepalive=off] [so_keepalive=%w*:%w*:%d*], [... next entry ...]", err)
 
       conf, err = conf_loader(nil, {
         proxy_listen = "127.0.0.1"
       })
       assert.is_nil(conf)
-      assert.equal("proxy_listen must be of form: [off] | <ip>:<port> [ssl] [http2] [proxy_protocol] [deferred] [bind] [reuseport] [backlog=%d+], [... next entry ...]", err)
+      assert.equal("proxy_listen must be of form: [off] | <ip>:<port> [ssl] [http2] [proxy_protocol] [deferred] [bind] [reuseport] [backlog=%d+] [ipv6only=on] [ipv6only=off] [so_keepalive=on] [so_keepalive=off] [so_keepalive=%w*:%w*:%d*], [... next entry ...]", err)
     end)
     it("rejects empty string in listen addresses", function()
       local conf, err = conf_loader(nil, {
         admin_listen = ""
       })
       assert.is_nil(conf)
-      assert.equal("admin_listen must be of form: [off] | <ip>:<port> [ssl] [http2] [proxy_protocol] [deferred] [bind] [reuseport] [backlog=%d+], [... next entry ...]", err)
+      assert.equal("admin_listen must be of form: [off] | <ip>:<port> [ssl] [http2] [proxy_protocol] [deferred] [bind] [reuseport] [backlog=%d+] [ipv6only=on] [ipv6only=off] [so_keepalive=on] [so_keepalive=off] [so_keepalive=%w*:%w*:%d*], [... next entry ...]", err)
 
       conf, err = conf_loader(nil, {
         proxy_listen = ""
       })
       assert.is_nil(conf)
-      assert.equal("proxy_listen must be of form: [off] | <ip>:<port> [ssl] [http2] [proxy_protocol] [deferred] [bind] [reuseport] [backlog=%d+], [... next entry ...]", err)
+      assert.equal("proxy_listen must be of form: [off] | <ip>:<port> [ssl] [http2] [proxy_protocol] [deferred] [bind] [reuseport] [backlog=%d+] [ipv6only=on] [ipv6only=off] [so_keepalive=on] [so_keepalive=off] [so_keepalive=%w*:%w*:%d*], [... next entry ...]", err)
     end)
     it("errors when dns_resolver is not a list in ipv4/6[:port] format", function()
       local conf, err = conf_loader(nil, {
@@ -655,7 +633,7 @@ describe("Configuration loader", function()
       assert.is_nil(conf)
 
       conf, err = conf_loader(nil, {
-        dns_resolver = "8.8.8.8:53"
+        dns_resolver = "198.51.100.0:53"
       })
       assert.is_nil(err)
       assert.is_table(conf)
@@ -667,10 +645,24 @@ describe("Configuration loader", function()
       assert.is_table(conf)
 
       conf, err = conf_loader(nil, {
-        dns_resolver = "8.8.8.8,1.2.3.4:53,::1,[::1]:53"
+        dns_resolver = "198.51.100.0,1.2.3.4:53,::1,[::1]:53"
       })
       assert.is_nil(err)
       assert.is_table(conf)
+    end)
+    it("errors when node_id is not a valid uuid", function()
+      local conf, err = conf_loader(nil, {
+        node_id = "foobar",
+      })
+      assert.equal("node_id must be a valid UUID", err)
+      assert.is_nil(conf)
+    end)
+    it("accepts a valid UUID as node_id", function()
+      local conf, err = conf_loader(nil, {
+        node_id = "8b7de2ba-0477-4667-a811-8bca46073ca9",
+      })
+      assert.is_nil(err)
+      assert.equal("8b7de2ba-0477-4667-a811-8bca46073ca9", conf.node_id)
     end)
     it("errors when the hosts file does not exist", function()
       local tmpfile = "/a_file_that_does_not_exist"
@@ -703,31 +695,58 @@ describe("Configuration loader", function()
       assert.is_nil(conf)
       assert.equal([[headers: invalid entry 'Foo-Bar']], err)
     end)
-    it("errors when hosts have a bad format in cassandra_contact_points", function()
-      local conf, err = conf_loader(nil, {
-          database                 = "cassandra",
-          cassandra_contact_points = [[some/really\bad/host\name,addr2]]
-      })
-      assert.equal([[bad cassandra contact point 'some/really\bad/host\name': invalid hostname: some/really\bad/host\name]], err)
-      assert.is_nil(conf)
-    end)
-    it("errors cassandra_refresh_frequency is < 0", function()
-      local conf, err = conf_loader(nil, {
-          database                    = "cassandra",
-          cassandra_refresh_frequency = -1,
-      })
-      assert.equal("cassandra_refresh_frequency must be 0 or greater", err)
-      assert.is_nil(conf)
-    end)
-    it("errors when specifying a port in cassandra_contact_points", function()
-      local conf, err = conf_loader(nil, {
-          database                 = "cassandra",
-          cassandra_contact_points = "addr1:9042,addr2"
-      })
-      assert.equal("bad cassandra contact point 'addr1:9042': port must be specified in cassandra_port", err)
-      assert.is_nil(conf)
-    end)
     describe("SSL", function()
+      it("accepts and decodes valid base64 values", function()
+        local ssl_fixtures = require "spec.fixtures.ssl"
+        local cert = ssl_fixtures.cert
+        local cacert = ssl_fixtures.cert_ca
+        local key = ssl_fixtures.key
+        local dhparam = ssl_fixtures.dhparam
+
+        local properties = {
+          ssl_cert = cert,
+          ssl_cert_key = key,
+          admin_ssl_cert = cert,
+          admin_ssl_cert_key = key,
+          status_ssl_cert = cert,
+          status_ssl_cert_key = key,
+          client_ssl_cert = cert,
+          client_ssl_cert_key = key,
+          cluster_cert = cert,
+          cluster_cert_key = key,
+          cluster_ca_cert = cacert,
+          ssl_dhparam = dhparam,
+          lua_ssl_trusted_certificate = cacert
+        }
+        local conf_params = {
+          ssl_cipher_suite = "old",
+          client_ssl = "on",
+          role = "control_plane",
+          status_listen = "127.0.0.1:123 ssl",
+          proxy_listen = "127.0.0.1:456 ssl",
+          admin_listen = "127.0.0.1:789 ssl"
+        }
+
+        for n, v in pairs(properties) do
+          conf_params[n] = ngx.encode_base64(v)
+        end
+        local conf, err = conf_loader(nil, conf_params)
+
+        assert.is_nil(err)
+        assert.is_table(conf)
+        for name, decoded_val in pairs(properties) do
+          local values = conf[name]
+          if type(values) == "table" then
+            for i = 1, #values do
+              assert.equals(decoded_val, values[i])
+            end
+          end
+
+          if type(values) == "string" then
+            assert.equals(decoded_val, values)
+          end
+        end
+      end)
       describe("proxy", function()
         it("does not check SSL cert and key if SSL is off", function()
           local conf, err = conf_loader(nil, {
@@ -770,8 +789,8 @@ describe("Configuration loader", function()
             ssl_cert_key = "/path/cert_key.pem"
           })
           assert.equal(2, #errors)
-          assert.contains("ssl_cert: no such file at /path/cert.pem", errors)
-          assert.contains("ssl_cert_key: no such file at /path/cert_key.pem", errors)
+          assert.contains("ssl_cert: failed loading certificate from /path/cert.pem", errors)
+          assert.contains("ssl_cert_key: failed loading key from /path/cert_key.pem", errors)
           assert.is_nil(conf)
 
           conf, _, errors = conf_loader(nil, {
@@ -779,7 +798,7 @@ describe("Configuration loader", function()
             ssl_cert_key = "/path/cert_key.pem"
           })
           assert.equal(1, #errors)
-          assert.contains("ssl_cert_key: no such file at /path/cert_key.pem", errors)
+          assert.contains("ssl_cert_key: failed loading key from /path/cert_key.pem", errors)
           assert.is_nil(conf)
         end)
         it("requires SSL DH param file to exist", function()
@@ -788,7 +807,7 @@ describe("Configuration loader", function()
             ssl_dhparam = "/path/dhparam.pem"
           })
           assert.equal(1, #errors)
-          assert.contains("ssl_dhparam: no such file at /path/dhparam.pem", errors)
+          assert.contains("ssl_dhparam: failed loading certificate from /path/dhparam.pem", errors)
           assert.is_nil(conf)
 
           conf, _, errors = conf_loader(nil, {
@@ -806,7 +825,7 @@ describe("Configuration loader", function()
             lua_ssl_trusted_certificate = "/path/cert.pem",
           })
           assert.equal(1, #errors)
-          assert.contains("lua_ssl_trusted_certificate: no such file at /path/cert.pem", errors)
+          assert.contains("lua_ssl_trusted_certificate: failed loading certificate from /path/cert.pem", errors)
           assert.is_nil(conf)
         end)
         it("accepts several CA certs in lua_ssl_trusted_certificate, setting lua_ssl_trusted_certificate_combined", function()
@@ -865,6 +884,30 @@ describe("Configuration loader", function()
           })
           assert.is_nil(errors)
         end)
+        it("requires cluster_cert and key files to exist", function()
+          local conf, _, errors = conf_loader(nil, {
+            role = "data_plane",
+            database = "off",
+            cluster_cert = "path/kong_clustering.crt",
+            cluster_cert_key = "path/kong_clustering.key",
+          })
+          assert.equal(2, #errors)
+          assert.contains("cluster_cert: failed loading certificate from path/kong_clustering.crt", errors)
+          assert.contains("cluster_cert_key: failed loading key from path/kong_clustering.key", errors)
+          assert.is_nil(conf)
+        end)
+        it("requires cluster_ca_cert file to exist", function()
+          local conf, _, errors = conf_loader(nil, {
+            role = "data_plane",
+            database = "off",
+            cluster_ca_cert = "path/kong_clustering_ca.crt",
+            cluster_cert = "spec/fixtures/kong_clustering.crt",
+            cluster_cert_key = "spec/fixtures/kong_clustering.key",
+          })
+          assert.equal(1, #errors)
+          assert.contains("cluster_ca_cert: failed loading certificate from path/kong_clustering_ca.crt", errors)
+          assert.is_nil(conf)
+        end)
         it("autoload cluster_cert or cluster_ca_cert for data plane in lua_ssl_trusted_certificate", function()
           local conf, _, errors = conf_loader(nil, {
             role = "data_plane",
@@ -894,6 +937,73 @@ describe("Configuration loader", function()
           )
           assert.matches(".ca_combined", conf.lua_ssl_trusted_certificate_combined)
         end)
+
+        it("validates proxy_server", function()
+          local conf, _, errors = conf_loader(nil, {
+            proxy_server = "http://cool:pwd@localhost:2333",
+          })
+          assert.is_nil(errors)
+          assert.is_table(conf)
+
+          local conf, _, errors = conf_loader(nil, {
+            proxy_server = "://localhost:2333",
+          })
+          assert.contains("proxy_server missing scheme", errors)
+          assert.is_nil(conf)
+
+
+          local conf, _, errors = conf_loader(nil, {
+            proxy_server = "cool://localhost:2333",
+          })
+          assert.contains("proxy_server only supports \"http\" and \"https\", got cool", errors)
+          assert.is_nil(conf)
+
+          local conf, _, errors = conf_loader(nil, {
+            proxy_server = "http://:2333",
+          })
+          assert.contains("proxy_server missing host", errors)
+          assert.is_nil(conf)
+
+
+          local conf, _, errors = conf_loader(nil, {
+            proxy_server = "http://localhost:2333/?a=1",
+          })
+          assert.contains("fragments, query strings or parameters are meaningless in proxy configuration", errors)
+          assert.is_nil(conf)
+        end)
+
+        it("doesn't allow cluster_use_proxy on CP but allows on DP", function()
+          local conf, _, errors = conf_loader(nil, {
+            role = "data_plane",
+            database = "off",
+            cluster_cert = "spec/fixtures/kong_clustering.crt",
+            cluster_cert_key = "spec/fixtures/kong_clustering.key",
+            cluster_use_proxy = "on",
+          })
+          assert.contains("cluster_use_proxy is turned on but no proxy_server is configured", errors)
+          assert.is_nil(conf)
+
+          local conf, _, errors = conf_loader(nil, {
+            role = "data_plane",
+            database = "off",
+            cluster_cert = "spec/fixtures/kong_clustering.crt",
+            cluster_cert_key = "spec/fixtures/kong_clustering.key",
+            cluster_use_proxy = "on",
+            proxy_server = "http://user:pass@localhost:2333/",
+          })
+          assert.is_nil(errors)
+          assert.is_table(conf)
+
+          local conf, _, errors = conf_loader(nil, {
+            role = "control_plane",
+            cluster_cert = "spec/fixtures/kong_clustering.crt",
+            cluster_cert_key = "spec/fixtures/kong_clustering.key",
+            cluster_use_proxy = "on",
+          })
+          assert.contains("cluster_use_proxy can not be used when role = \"control_plane\"", errors)
+          assert.is_nil(conf)
+        end)
+
         it("doen't overwrite lua_ssl_trusted_certificate when autoload cluster_cert or cluster_ca_cert", function()
           local conf, _, errors = conf_loader(nil, {
             role = "data_plane",
@@ -1050,8 +1160,8 @@ describe("Configuration loader", function()
             client_ssl_cert_key = "/path/cert_key.pem"
           })
           assert.equal(2, #errors)
-          assert.contains("client_ssl_cert: no such file at /path/cert.pem", errors)
-          assert.contains("client_ssl_cert_key: no such file at /path/cert_key.pem", errors)
+          assert.contains("client_ssl_cert: failed loading certificate from /path/cert.pem", errors)
+          assert.contains("client_ssl_cert_key: failed loading key from /path/cert_key.pem", errors)
           assert.is_nil(conf)
 
           conf, _, errors = conf_loader(nil, {
@@ -1060,7 +1170,7 @@ describe("Configuration loader", function()
             client_ssl_cert_key = "/path/cert_key.pem"
           })
           assert.equal(1, #errors)
-          assert.contains("client_ssl_cert_key: no such file at /path/cert_key.pem", errors)
+          assert.contains("client_ssl_cert_key: failed loading key from /path/cert_key.pem", errors)
           assert.is_nil(conf)
         end)
         it("resolves SSL cert/key to absolute path", function()
@@ -1117,8 +1227,8 @@ describe("Configuration loader", function()
             admin_ssl_cert_key = "/path/cert_key.pem"
           })
           assert.equal(2, #errors)
-          assert.contains("admin_ssl_cert: no such file at /path/cert.pem", errors)
-          assert.contains("admin_ssl_cert_key: no such file at /path/cert_key.pem", errors)
+          assert.contains("admin_ssl_cert: failed loading certificate from /path/cert.pem", errors)
+          assert.contains("admin_ssl_cert_key: failed loading key from /path/cert_key.pem", errors)
           assert.is_nil(conf)
 
           conf, _, errors = conf_loader(nil, {
@@ -1126,7 +1236,7 @@ describe("Configuration loader", function()
             admin_ssl_cert_key = "/path/cert_key.pem"
           })
           assert.equal(1, #errors)
-          assert.contains("admin_ssl_cert_key: no such file at /path/cert_key.pem", errors)
+          assert.contains("admin_ssl_cert_key: failed loading key from /path/cert_key.pem", errors)
           assert.is_nil(conf)
         end)
         it("resolves SSL cert/key to absolute path", function()
@@ -1188,8 +1298,8 @@ describe("Configuration loader", function()
             status_ssl_cert_key = "/path/cert_key.pem"
           })
           assert.equal(2, #errors)
-          assert.contains("status_ssl_cert: no such file at /path/cert.pem", errors)
-          assert.contains("status_ssl_cert_key: no such file at /path/cert_key.pem", errors)
+          assert.contains("status_ssl_cert: failed loading certificate from /path/cert.pem", errors)
+          assert.contains("status_ssl_cert_key: failed loading key from /path/cert_key.pem", errors)
           assert.is_nil(conf)
 
           conf, _, errors = conf_loader(nil, {
@@ -1198,7 +1308,7 @@ describe("Configuration loader", function()
             status_ssl_cert_key = "/path/cert_key.pem"
           })
           assert.equal(1, #errors)
-          assert.contains("status_ssl_cert_key: no such file at /path/cert_key.pem", errors)
+          assert.contains("status_ssl_cert_key: failed loading key from /path/cert_key.pem", errors)
           assert.is_nil(conf)
         end)
         it("resolves SSL cert/key to absolute path", function()
@@ -1213,6 +1323,14 @@ describe("Configuration loader", function()
             assert.True(helpers.path.isabs(conf.status_ssl_cert[i]))
             assert.True(helpers.path.isabs(conf.status_ssl_cert_key[i]))
           end
+        end)
+        it("supports HTTP/2", function()
+          local conf, err = conf_loader(nil, {
+            status_listen = "127.0.0.1:123 ssl http2",
+          })
+          assert.is_nil(err)
+          assert.is_table(conf)
+          assert.same({ "127.0.0.1:123 ssl http2" }, conf.status_listen)
         end)
       end)
 
@@ -1251,17 +1369,6 @@ describe("Configuration loader", function()
 
       local conf = assert(conf_loader(helpers.test_conf_path))
       assert.equal("postgres", conf.database)
-    end)
-    it("requires cassandra_local_datacenter if DCAware LB policy is in use", function()
-      for _, policy in ipairs({ "DCAwareRoundRobin", "RequestDCAwareRoundRobin" }) do
-        local conf, err = conf_loader(nil, {
-          database            = "cassandra",
-          cassandra_lb_policy = policy,
-        })
-        assert.is_nil(conf)
-        assert.equal("must specify 'cassandra_local_datacenter' when " ..
-                     policy .. " policy is in use", err)
-      end
     end)
     it("honors path if provided even if a default file exists", function()
       conf_loader.add_default_path("spec/fixtures/to-strip.conf")
@@ -1310,6 +1417,106 @@ describe("Configuration loader", function()
       })
       assert.is_nil(conf)
       assert.equal("pg_semaphore_timeout must be an integer greater than 0", err)
+    end)
+  end)
+
+  describe("pg connection pool options", function()
+    it("rejects a pg_keepalive_timeout with a negative number", function()
+      local conf, err = conf_loader(nil, {
+        pg_keepalive_timeout = -1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_keepalive_timeout must be greater than 0", err)
+    end)
+
+    it("rejects a pg_keepalive_timeout with a decimal", function()
+      local conf, err = conf_loader(nil, {
+        pg_keepalive_timeout = 0.1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_keepalive_timeout must be an integer greater than 0", err)
+    end)
+
+    it("rejects a pg_pool_size with a negative number", function()
+      local conf, err = conf_loader(nil, {
+        pg_pool_size = -1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_pool_size must be greater than 0", err)
+    end)
+
+    it("rejects a pg_pool_size with a decimal", function()
+      local conf, err = conf_loader(nil, {
+        pg_pool_size = 0.1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_pool_size must be an integer greater than 0", err)
+    end)
+
+    it("rejects a pg_backlog with a negative number", function()
+      local conf, err = conf_loader(nil, {
+        pg_backlog = -1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_backlog must be greater than 0", err)
+    end)
+
+    it("rejects a pg_backlog with a decimal", function()
+      local conf, err = conf_loader(nil, {
+        pg_backlog = 0.1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_backlog must be an integer greater than 0", err)
+    end)
+  end)
+
+  describe("pg read-only connection pool options", function()
+    it("rejects a pg_ro_keepalive_timeout with a negative number", function()
+      local conf, err = conf_loader(nil, {
+        pg_ro_keepalive_timeout = -1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_ro_keepalive_timeout must be greater than 0", err)
+    end)
+
+    it("rejects a pg_ro_keepalive_timeout with a decimal", function()
+      local conf, err = conf_loader(nil, {
+        pg_ro_keepalive_timeout = 0.1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_ro_keepalive_timeout must be an integer greater than 0", err)
+    end)
+
+    it("rejects a pg_ro_pool_size with a negative number", function()
+      local conf, err = conf_loader(nil, {
+        pg_ro_pool_size = -1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_ro_pool_size must be greater than 0", err)
+    end)
+
+    it("rejects a pg_ro_pool_size with a decimal", function()
+      local conf, err = conf_loader(nil, {
+        pg_ro_pool_size = 0.1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_ro_pool_size must be an integer greater than 0", err)
+    end)
+
+    it("rejects a pg_ro_backlog with a negative number", function()
+      local conf, err = conf_loader(nil, {
+        pg_ro_backlog = -1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_ro_backlog must be greater than 0", err)
+    end)
+
+    it("rejects a pg_ro_backlog with a decimal", function()
+      local conf, err = conf_loader(nil, {
+        pg_ro_backlog = 0.1,
+      })
+      assert.is_nil(conf)
+      assert.equal("pg_ro_backlog must be an integer greater than 0", err)
     end)
   end)
 
@@ -1441,12 +1648,14 @@ describe("Configuration loader", function()
     end)
     it("returns all errors in ret value #3", function()
       local conf, _, errors = conf_loader(nil, {
-        cassandra_repl_strategy = "foo",
-        ssl_cert_key = "spec/fixtures/kong_spec.key"
+        worker_consistency = "magical",
+        ssl_cert_key = "spec/fixtures/kong_spec.key",
       })
+
       assert.equal(2, #errors)
       assert.is_nil(conf)
-      assert.contains("cassandra_repl_strategy has", errors, true)
+      assert.contains("worker_consistency has an invalid value: 'magical' (strict, eventual)",
+        errors, true)
       assert.contains("ssl_cert must be specified", errors)
     end)
   end)
@@ -1455,39 +1664,29 @@ describe("Configuration loader", function()
     it("replaces sensitive settings", function()
       local conf = assert(conf_loader(nil, {
         pg_password = "hide_me",
-        cassandra_password = "hide_me",
       }))
 
       local purged_conf = conf_loader.remove_sensitive(conf)
       assert.not_equal("hide_me", purged_conf.pg_password)
-      assert.not_equal("hide_me", purged_conf.cassandra_password)
     end)
 
     it("replaces sensitive vault resolved settings", function()
       finally(function()
         helpers.unsetenv("PG_PASSWORD")
         helpers.unsetenv("PG_DATABASE")
-        helpers.unsetenv("CASSANDRA_PASSWORD")
-        helpers.unsetenv("CASSANDRA_KEYSPACE")
       end)
 
       helpers.setenv("PG_PASSWORD", "pg-password")
       helpers.setenv("PG_DATABASE", "pg-database")
-      helpers.setenv("CASSANDRA_PASSWORD", "cassandra-password")
-      helpers.setenv("CASSANDRA_KEYSPACE", "cassandra-keyspace")
 
       local conf = assert(conf_loader(nil, {
         pg_password = "{vault://env/pg-password}",
         pg_database = "{vault://env/pg-database}",
-        cassandra_password = "{vault://env/cassandra-password}",
-        cassandra_keyspace = "{vault://env/cassandra-keyspace}",
       }))
 
       local purged_conf = conf_loader.remove_sensitive(conf)
       assert.equal("******", purged_conf.pg_password)
       assert.equal("{vault://env/pg-database}", purged_conf.pg_database)
-      assert.equal("******", purged_conf.cassandra_password)
-      assert.equal("{vault://env/cassandra-keyspace}", purged_conf.cassandra_keyspace)
       assert.is_nil(purged_conf["$refs"])
     end)
 
@@ -1495,19 +1694,16 @@ describe("Configuration loader", function()
       local conf = assert(conf_loader())
       local purged_conf = conf_loader.remove_sensitive(conf)
       assert.is_nil(purged_conf.pg_password)
-      assert.is_nil(purged_conf.cassandra_password)
     end)
   end)
 
   describe("number as string", function()
-    it("force the numeric pg_password/cassandra_password to a string", function()
+    it("force the numeric pg_password to a string", function()
       local conf = assert(conf_loader(nil, {
         pg_password = 123456,
-        cassandra_password = 123456
       }))
 
       assert.equal("123456", conf.pg_password)
-      assert.equal("123456", conf.cassandra_password)
     end)
   end)
 
@@ -1517,6 +1713,38 @@ describe("Configuration loader", function()
         worker_consistency = "strict"
       }))
       assert.equal("strict", conf.worker_consistency)
+      assert.equal(nil, err)
+    end)
+
+    it("opentelemetry_tracing", function()
+      local conf, err = assert(conf_loader(nil, {
+        opentelemetry_tracing = "request,router",
+      }))
+      assert.same({"request", "router"}, conf.tracing_instrumentations)
+      assert.equal(nil, err)
+
+      -- no clobber
+      conf, err = assert(conf_loader(nil, {
+        opentelemetry_tracing = "request,router",
+        tracing_instrumentations = "balancer",
+      }))
+      assert.same({ "balancer" }, conf.tracing_instrumentations)
+      assert.equal(nil, err)
+    end)
+
+    it("opentelemetry_tracing_sampling_rate", function()
+      local conf, err = assert(conf_loader(nil, {
+        opentelemetry_tracing_sampling_rate = 0.5,
+      }))
+      assert.same(0.5, conf.tracing_sampling_rate)
+      assert.equal(nil, err)
+
+      -- no clobber
+      conf, err = assert(conf_loader(nil, {
+        opentelemetry_tracing_sampling_rate = 0.5,
+        tracing_sampling_rate = 0.75,
+      }))
+      assert.same(0.75, conf.tracing_sampling_rate)
       assert.equal(nil, err)
     end)
   end)
@@ -1551,4 +1779,157 @@ describe("Configuration loader", function()
       assert.equal("{vault://env/pg-port#0}", conf["$refs"].pg_port)
     end)
   end)
+
+  describe("comments", function()
+    it("are stripped", function()
+      local conf = assert(conf_loader(helpers.test_conf_path))
+      assert.equal("foo#bar", conf.pg_password)
+    end)
+  end)
+
+  describe("lua max limits for request/response headers and request uri/post args", function()
+    it("are accepted", function()
+      local conf, err = assert(conf_loader(nil, {
+        lua_max_req_headers = 1,
+        lua_max_resp_headers = 100,
+        lua_max_uri_args = 500,
+        lua_max_post_args = 1000,
+      }))
+
+      assert.is_nil(err)
+
+      assert.equal(1, conf.lua_max_req_headers)
+      assert.equal(100, conf.lua_max_resp_headers)
+      assert.equal(500, conf.lua_max_uri_args)
+      assert.equal(1000, conf.lua_max_post_args)
+    end)
+
+    it("are not accepted with limits below 1", function()
+      local _, err = conf_loader(nil, {
+        lua_max_req_headers = 0,
+      })
+      assert.equal("lua_max_req_headers must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_resp_headers = 0,
+      })
+      assert.equal("lua_max_resp_headers must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_uri_args = 0,
+      })
+      assert.equal("lua_max_uri_args must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_post_args = 0,
+      })
+      assert.equal("lua_max_post_args must be an integer between 1 and 1000", err)
+    end)
+
+    it("are not accepted with limits above 1000", function()
+      local _, err = conf_loader(nil, {
+        lua_max_req_headers = 1001,
+      })
+      assert.equal("lua_max_req_headers must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_resp_headers = 1001,
+      })
+      assert.equal("lua_max_resp_headers must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_uri_args = 1001,
+      })
+      assert.equal("lua_max_uri_args must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_post_args = 1001,
+      })
+      assert.equal("lua_max_post_args must be an integer between 1 and 1000", err)
+    end)
+  end)
+
+  describe("Labels", function()
+    local pattern_match_err = ".+ is invalid. Must match pattern: .+"
+    local size_err = ".* must have between 1 and %d+ characters"
+    local invalid_key_err = "label key validation failed: "
+    local invalid_val_err = "label value validation failed: "
+    local valid_labels = {
+      "deployment:mycloud,region:us-east-1",
+      "label_0_name:label-1-value,label-1-name:label_1_value",
+      "MY-LaB3L.nam_e:my_lA831..val",
+      "super_kong:yey",
+      "best_gateway:kong",
+      "This_Key_Is_Just_The_Right_Maximum_Length_To_Pass_TheValidation:value",
+      "key:This_Val_Is_Just_The_Right_Maximum_Length_To_Pass_TheValidation",
+    }
+    local invalid_labels = {
+      {
+        l = "t:h,e:s,E:a,r:e,T:o,o:m,a:n,y:l,A:b,ee:l,S:s",
+        err = "labels validation failed: count exceeded %d+ max elements",
+      },{
+        l = "_must:start",
+        err = invalid_key_err .. pattern_match_err,
+      },{
+        l = "and:.end",
+        err = invalid_val_err .. pattern_match_err,
+      },{
+        l = "with-:alpha",
+        err = invalid_key_err .. pattern_match_err,
+      },{
+        l = "numeric:characters_",
+        err = invalid_val_err .. pattern_match_err,
+      },{
+        l = "kong_key:is_reserved",
+        err = invalid_key_err .. pattern_match_err,
+      },{
+        l = "invalid!@chars:fail",
+        err = invalid_key_err .. pattern_match_err,
+      },{
+        l = "the:val!dation",
+        err = invalid_val_err .. pattern_match_err,
+      },{
+        l = "lonelykeywithnoval:",
+        err = invalid_val_err .. size_err,
+      },{
+        l = "__look_this_key_is_way_too_long_no_way_it_will_pass_validation__:value",
+        err = invalid_key_err .. size_err,
+      },{
+        l = "key:__look_this_val_is_way_too_long_no_way_it_will_pass_validation__",
+        err = invalid_val_err .. size_err,
+      },{
+        l = "key",
+        err = invalid_key_err .. size_err,
+      }
+    }
+
+    it("succeeds to validate valid labels", function()
+      for _, label in ipairs(valid_labels) do
+        local conf, err = assert(conf_loader(nil, {
+          role = "data_plane",
+          database = "off",
+          cluster_cert = "spec/fixtures/kong_clustering.crt",
+          cluster_cert_key = "spec/fixtures/kong_clustering.key",
+          cluster_dp_labels = label,
+        }))
+        assert.is_nil(err)
+        assert.is_not_nil(conf.cluster_dp_labels)
+      end
+    end)
+
+    it("fails validation for invalid labels", function()
+      for _, label in ipairs(invalid_labels) do
+        local _, err = conf_loader(nil, {
+          role = "data_plane",
+          database = "off",
+          cluster_cert = "spec/fixtures/kong_clustering.crt",
+          cluster_cert_key = "spec/fixtures/kong_clustering.key",
+          cluster_dp_labels = label.l,
+        })
+        assert.is_not_nil(err)
+        assert.matches(label.err, err)
+      end
+    end)
+  end)
+
 end)

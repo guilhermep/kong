@@ -22,7 +22,6 @@ events {
 
 > if role == "control_plane" or #proxy_listeners > 0 or #admin_listeners > 0 or #status_listeners > 0 then
 http {
-    charset UTF-8;
     server_tokens off;
 
     error_log ${{PROXY_ERROR_LOG}} ${{LOG_LEVEL}};
@@ -41,16 +40,12 @@ http {
     lua_shared_dict kong                        5m;
     lua_shared_dict kong_locks                  8m;
     lua_shared_dict kong_healthchecks           5m;
-    lua_shared_dict kong_process_events         5m;
     lua_shared_dict kong_cluster_events         5m;
     lua_shared_dict kong_rate_limiting_counters 12m;
     lua_shared_dict kong_core_db_cache          ${{MEM_CACHE_SIZE}};
     lua_shared_dict kong_core_db_cache_miss     12m;
     lua_shared_dict kong_db_cache               ${{MEM_CACHE_SIZE}};
     lua_shared_dict kong_db_cache_miss          12m;
-> if database == "cassandra" then
-    lua_shared_dict kong_cassandra              5m;
-> end
 > if role == "control_plane" then
     lua_shared_dict kong_clustering             5m;
 > end
@@ -98,7 +93,7 @@ http {
         listen $(entry.listener);
 > end
 
-        error_page 400 404 408 411 412 413 414 417 494 /kong_error_handler;
+        error_page 400 404 405 408 411 412 413 414 417 494 /kong_error_handler;
         error_page 500 502 503 504                     /kong_error_handler;
 
         access_log ${{PROXY_ACCESS_LOG}};
@@ -109,7 +104,7 @@ http {
         ssl_certificate     $(ssl_cert[i]);
         ssl_certificate_key $(ssl_cert_key[i]);
 > end
-        ssl_session_cache   shared:SSL:10m;
+        ssl_session_cache   shared:SSL:${{SSL_SESSION_CACHE_SIZE}};
         ssl_certificate_by_lua_block {
             Kong.ssl_certificate()
         }
@@ -354,6 +349,7 @@ http {
 
 > if (role == "control_plane" or role == "traditional") and #admin_listeners > 0 then
     server {
+        charset UTF-8;
         server_name kong_admin;
 > for _, entry in ipairs(admin_listeners) do
         listen $(entry.listener);
@@ -393,6 +389,7 @@ http {
 
 > if #status_listeners > 0 then
     server {
+        charset UTF-8;
         server_name kong_status;
 > for _, entry in ipairs(status_listeners) do
         listen $(entry.listener);
@@ -432,6 +429,7 @@ http {
 
 > if role == "control_plane" then
     server {
+        charset UTF-8;
         server_name kong_cluster_listener;
 > for _, entry in ipairs(cluster_listeners) do
         listen $(entry.listener) ssl;
@@ -448,12 +446,6 @@ http {
         location = /v1/outlet {
             content_by_lua_block {
                 Kong.serve_cluster_listener()
-            }
-        }
-
-        location = /v1/wrpc {
-            content_by_lua_block {
-                Kong.serve_wrpc_listener()
             }
         }
     }
@@ -553,7 +545,7 @@ http {
             }
             content_by_lua_block {
                 local mu = require "spec.fixtures.mock_upstream"
-                return mu.send_default_json_response({}, ngx.req.get_uri_args())
+                return mu.send_default_json_response({}, ngx.req.get_uri_args(0))
             }
         }
 
@@ -714,8 +706,8 @@ http {
 
     include '*.http_mock';
 
-> if not legacy_worker_events then
     server {
+        charset UTF-8;
         server_name kong_worker_events;
         listen unix:${{PREFIX}}/worker_events.sock;
         access_log off;
@@ -725,11 +717,10 @@ http {
             }
         }
     }
-> end -- not legacy_worker_events
 }
 > end
 
-> if #stream_listeners > 0 then
+> if #stream_listeners > 0 or cluster_ssl_tunnel then
 stream {
     log_format basic '$remote_addr [$time_local] '
                      '$protocol $status $bytes_sent $bytes_received '
@@ -749,16 +740,12 @@ stream {
     lua_shared_dict stream_kong                        5m;
     lua_shared_dict stream_kong_locks                  8m;
     lua_shared_dict stream_kong_healthchecks           5m;
-    lua_shared_dict stream_kong_process_events         5m;
     lua_shared_dict stream_kong_cluster_events         5m;
     lua_shared_dict stream_kong_rate_limiting_counters 12m;
     lua_shared_dict stream_kong_core_db_cache          ${{MEM_CACHE_SIZE}};
     lua_shared_dict stream_kong_core_db_cache_miss     12m;
     lua_shared_dict stream_kong_db_cache               ${{MEM_CACHE_SIZE}};
     lua_shared_dict stream_kong_db_cache_miss          12m;
-> if database == "cassandra" then
-    lua_shared_dict stream_kong_cassandra              5m;
-> end
 
 > if ssl_ciphers then
     ssl_ciphers ${{SSL_CIPHERS}};
@@ -829,7 +816,7 @@ stream {
         ssl_certificate     $(ssl_cert[i]);
         ssl_certificate_key $(ssl_cert_key[i]);
 > end
-        ssl_session_cache   shared:StreamSSL:10m;
+        ssl_session_cache   shared:StreamSSL:${{SSL_SESSION_CACHE_SIZE}};
         ssl_certificate_by_lua_block {
             Kong.ssl_certificate()
         }
@@ -839,6 +826,8 @@ stream {
             Kong.preread()
         }
 
+        set $upstream_host '';
+        proxy_ssl_name $upstream_host;
         proxy_ssl on;
         proxy_ssl_server_name on;
 > if client_ssl then
@@ -963,7 +952,6 @@ server {
         }
     }
 
-> if not legacy_worker_events then
     server {
         listen unix:${{PREFIX}}/stream_worker_events.sock;
         access_log off;
@@ -971,7 +959,27 @@ server {
           require("resty.events.compat").run()
         }
     }
-> end -- not legacy_worker_events
+
+> if cluster_ssl_tunnel then
+    server {
+        listen unix:${{PREFIX}}/cluster_proxy_ssl_terminator.sock;
+
+        proxy_pass ${{cluster_ssl_tunnel}};
+        proxy_ssl on;
+        # as we are essentially talking in HTTPS, passing SNI should default turned on
+        proxy_ssl_server_name on;
+> if proxy_server_ssl_verify then
+        proxy_ssl_verify on;
+> if lua_ssl_trusted_certificate_combined then
+        proxy_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE_COMBINED}}';
+> end
+        proxy_ssl_verify_depth 5; # 5 should be sufficient
+> else
+        proxy_ssl_verify off;
+> end
+        proxy_socket_keepalive on;
+    }
+> end -- cluster_ssl_tunnel
 
 }
 > end

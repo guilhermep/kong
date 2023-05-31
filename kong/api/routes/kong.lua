@@ -5,13 +5,16 @@ local Errors = require "kong.db.errors"
 local process = require "ngx.process"
 
 local kong = kong
+local meta = require "kong.meta"
 local knode  = (kong and kong.node) and kong.node or
                require "kong.pdk.node".new()
 local errors = Errors.new()
+local get_sys_filter_level = require "ngx.errlog".get_sys_filter_level
+local LOG_LEVELS = require "kong.constants".LOG_LEVELS
 
 
 local tagline = "Welcome to " .. _KONG._NAME
-local version = _KONG._VERSION
+local version = meta.version
 local lua_version = jit and jit.version or _VERSION
 
 
@@ -97,6 +100,9 @@ return {
         }
       end
 
+      local configuration = kong.configuration.remove_sensitive()
+      configuration.log_level = LOG_LEVELS[get_sys_filter_level()]
+
       return kong.response.exit(200, {
         tagline = tagline,
         version = version,
@@ -111,7 +117,7 @@ return {
           enabled_in_cluster = distinct_plugins,
         },
         lua_version = lua_version,
-        configuration = kong.configuration.remove_sensitive(),
+        configuration = configuration,
         pids = pids,
       })
     end
@@ -119,15 +125,20 @@ return {
   ["/endpoints"] = {
     GET = function(self, dao, helpers)
       local endpoints = setmetatable({}, cjson.array_mt)
-      local lapis_endpoints = require("kong.api").ordered_routes
-
-      for k, v in pairs(lapis_endpoints) do
-        if type(k) == "string" then -- skip numeric indices
-          endpoints[#endpoints + 1] = k:gsub(":([^/:]+)", function(m)
-              return "{" .. m .. "}"
-            end)
+      local application = require("kong.api")
+      local each_route = require("lapis.application.route_group").each_route
+      local filled_endpoints = {}
+      each_route(application, true, function(path)
+        if type(path) == "table" then
+          path = next(path)
         end
-      end
+        if not filled_endpoints[path] then
+          filled_endpoints[path] = true
+          endpoints[#endpoints + 1] = path:gsub(":([^/:]+)", function(m)
+            return "{" .. m .. "}"
+          end)
+        end
+      end)
       table.sort(endpoints, function(a, b)
         -- when sorting use lower-ascii char for "/" to enable segment based
         -- sorting, so not this:
@@ -185,4 +196,19 @@ return {
       return kong.response.exit(200, copy)
     end
   },
+  ["/timers"] = {
+    GET = function (self, db, helpers)
+      local body = {
+        worker = {
+          id = ngx.worker.id(),
+          count = ngx.worker.count(),
+        },
+        stats = kong.timer:stats({
+          verbose = true,
+          flamegraph = true,
+        })
+      }
+      return kong.response.exit(200, body)
+    end
+  }
 }

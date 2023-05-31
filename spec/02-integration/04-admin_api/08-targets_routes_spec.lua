@@ -1,6 +1,7 @@
 local helpers = require "spec.helpers"
 local cjson = require "cjson"
-local utils   = require "kong.tools.utils"
+local utils = require "kong.tools.utils"
+local tablex = require "pl.tablex"
 
 local function it_content_types(title, fn)
   local test_form_encoded = fn("application/x-www-form-urlencoded")
@@ -312,7 +313,7 @@ describe("Admin API #" .. strategy, function()
 
       local function add_targets(target_fmt)
         local targets = {}
-        local weights = { 0, 10, 10, 10 }
+        local weights = { 10, 10, 10, 10 }
 
         for i = 1, #weights do
           local status, body = client_send({
@@ -411,8 +412,12 @@ describe("Admin API #" .. strategy, function()
       end)
 
       describe("with healthchecks on", function()
+        local checked
         before_each(function()
-          local status = client_send({
+          if checked == nil then
+            ngx.sleep(1)
+          end
+          local status, body = client_send({
             method = "PATCH",
             path = "/upstreams/" .. upstream.name,
             headers = {
@@ -434,6 +439,11 @@ describe("Admin API #" .. strategy, function()
             }
           })
           assert.same(200, status)
+          if checked == nil then
+            local json = assert(cjson.decode(body))
+            assert.truthy(upstream.updated_at < json.updated_at)
+            checked = true
+          end
         end)
 
         it("returns DNS_ERROR if DNS cannot be resolved", function()
@@ -452,13 +462,12 @@ describe("Admin API #" .. strategy, function()
 
         end)
 
-        -- FIXME this test is flaky in CI only
-        it("#flaky returns UNHEALTHY if failure detected", function()
+        it("returns UNHEALTHY if failure detected", function()
 
           local targets = add_targets("custom_localhost:222%d")
 
           local status = client_send({
-            method = "PATCH",
+            method = "PUT",
             path = "/upstreams/" .. upstream.name,
             headers = {
               ["Content-Type"] = "application/json",
@@ -467,10 +476,10 @@ describe("Admin API #" .. strategy, function()
               healthchecks = {
                 active = {
                   healthy = {
-                    interval = 0.1,
+                    interval = 1,
                   },
                   unhealthy = {
-                    interval = 0.1,
+                    interval = 1,
                     tcp_failures = 1,
                   },
                 }
@@ -479,11 +488,127 @@ describe("Admin API #" .. strategy, function()
           })
           assert.same(200, status)
 
-          -- Give time for active healthchecks to kick in
+          helpers.pwait_until(function()
+            check_health_endpoint(targets, 4, "UNHEALTHY")
+          end, 15)
+
+        end)
+
+        it("returns HEALTHCHECKS_OFF for target with weight 0", function ()
+          local status, _ = client_send({
+            method = "POST",
+            path = "/upstreams/" .. upstream.name .. "/targets",
+            headers = {
+              ["Content-Type"] = "application/json",
+            },
+            body = {
+              target = "custom_localhost:2221",
+              weight = 0,
+            }
+          })
+          assert.same(201, status)
+
+          helpers.pwait_until(function ()
+            local status, body = client_send({
+              method = "GET",
+              path = "/upstreams/" .. upstream.name .. "/health",
+            })
+            assert.same(200, status)
+            local res = assert(cjson.decode(body))
+            local function check_health_addresses(addresses, health)
+              for i=1, #addresses do
+                assert.same(health, addresses[i].health)
+              end
+            end
+            assert.equal(1, #res.data)
+            check_health_addresses(res.data[1].data.addresses, "HEALTHCHECKS_OFF")
+          end, 15)
+
+        end)
+
+        local function check_health_addresses(addresses, health)
+          for i=1, #addresses do
+            assert.same(health, addresses[i].health)
+          end
+        end
+
+        it("returns HEALTHCHECKS_OFF for target with weight 0", function ()
+          local status, _ = client_send({
+            method = "POST",
+            path = "/upstreams/" .. upstream.name .. "/targets",
+            headers = {
+              ["Content-Type"] = "application/json",
+            },
+            body = {
+              target = "custom_localhost:2221",
+              weight = 0,
+            }
+          })
+          assert.same(201, status)
+
+          -- Give time for weight modification to kick in
           ngx.sleep(0.3)
 
-          check_health_endpoint(targets, 4, "UNHEALTHY")
+          local status, body = client_send({
+            method = "GET",
+            path = "/upstreams/" .. upstream.name .. "/health",
+          })
+          assert.same(200, status)
+          local res = assert(cjson.decode(body))
+          assert.equal(1, #res.data)
+          check_health_addresses(res.data[1].data.addresses, "HEALTHCHECKS_OFF")
+        end)
 
+        it("return HEALTHY if weight of target turns from zero to non-zero", function ()
+          local status, _ = client_send({
+            method = "POST",
+            path = "/upstreams/" .. upstream.name .. "/targets",
+            headers = {
+              ["Content-Type"] = "application/json",
+            },
+            body = {
+              target = "custom_localhost:2221",
+              weight = 0,
+            }
+          })
+          assert.same(201, status)
+
+          -- Give time for weight modification to kick in
+          ngx.sleep(0.3)
+
+          local status, body = client_send({
+            method = "GET",
+            path = "/upstreams/" .. upstream.name .. "/health",
+          })
+          assert.same(200, status)
+          local res = assert(cjson.decode(body))
+          assert.equal(1, #res.data)
+          check_health_addresses(res.data[1].data.addresses, "HEALTHCHECKS_OFF")
+
+          local status = client_send({
+            method = "PATCH",
+            path = "/upstreams/" .. upstream.name .. "/targets/custom_localhost:2221",
+            headers = {
+              ["Content-Type"] = "application/json",
+            },
+            body = {
+              -- target = "custom_localhost:2221",
+              weight = 10,
+            },
+          })
+          assert.same(200, status)
+
+          -- Give time for weight modification to kick in
+          ngx.sleep(0.3)
+
+          local status, body = client_send({
+            method = "GET",
+            path = "/upstreams/" .. upstream.name .. "/health",
+          })
+          assert.same(200, status)
+          local res = assert(cjson.decode(body))
+          assert.equal(1, #res.data)
+          check_health_addresses(res.data[1].data.addresses, "HEALTHY")
         end)
       end)
     end)
@@ -560,7 +685,7 @@ describe("Admin API #" .. strategy, function()
           pages[i] = json
         end
       end)
-      it("ingores filters", function()
+      it("ignores filters", function()
         local res = assert(client:send {
           method = "GET",
           path = "/upstreams/" .. upstream.name .. "/targets/all",
@@ -681,62 +806,84 @@ describe("Admin API #" .. strategy, function()
 
         it("flips the target status from UNHEALTHY to HEALTHY", function()
           local status, body, json
+
           status, body = assert(client_send {
             method = "PUT",
             path = target_path .. "/unhealthy"
           })
           assert.same(204, status, body)
-          status, body = assert(client_send {
-            method = "GET",
-            path = "/upstreams/" .. upstream.id .. "/health"
-          })
-          assert.same(200, status)
-          json = assert(cjson.decode(body))
-          assert.same(target.target, json.data[1].target)
-          assert.same("UNHEALTHY", json.data[1].health)
+
+          helpers.pwait_until(function()
+            status, body = assert(client_send {
+              method = "GET",
+              path = "/upstreams/" .. upstream.id .. "/health"
+            })
+
+            assert.same(200, status)
+            json = assert(cjson.decode(body))
+            assert.same(target.target, json.data[1].target)
+            assert.same("UNHEALTHY", json.data[1].health)
+          end, 15)
+
           status = assert(client_send {
             method = "PUT",
             path = target_path .. "/healthy"
           })
           assert.same(204, status)
-          status, body = assert(client_send {
-            method = "GET",
-            path = "/upstreams/" .. upstream.id .. "/health"
-          })
-          assert.same(200, status)
-          json = assert(cjson.decode(body))
-          assert.same(target.target, json.data[1].target)
-          assert.same("HEALTHY", json.data[1].health)
+
+          helpers.pwait_until(function()
+            status, body = assert(client_send {
+              method = "GET",
+              path = "/upstreams/" .. upstream.id .. "/health"
+            })
+
+            assert.same(200, status)
+            json = assert(cjson.decode(body))
+            assert.same(target.target, json.data[1].target)
+            assert.same("HEALTHY", json.data[1].health)
+          end, 15)
+
         end)
 
         it("flips the target status from HEALTHY to UNHEALTHY", function()
           local status, body, json
+
           status = assert(client_send {
             method = "PUT",
             path = target_path .. "/healthy"
           })
           assert.same(204, status)
-          status, body = assert(client_send {
-            method = "GET",
-            path = "/upstreams/" .. upstream.id .. "/health"
-          })
-          assert.same(200, status)
-          json = assert(cjson.decode(body))
-          assert.same(target.target, json.data[1].target)
-          assert.same("HEALTHY", json.data[1].health)
+
+          helpers.pwait_until(function ()
+            status, body = assert(client_send {
+              method = "GET",
+              path = "/upstreams/" .. upstream.id .. "/health"
+            })
+
+            assert.same(200, status)
+            json = assert(cjson.decode(body))
+            assert.same(target.target, json.data[1].target)
+            assert.same("HEALTHY", json.data[1].health)
+          end, 15)
+
           status = assert(client_send {
             method = "PUT",
             path = target_path .. "/unhealthy"
           })
           assert.same(204, status)
-          status, body = assert(client_send {
-            method = "GET",
-            path = "/upstreams/" .. upstream.id .. "/health"
-          })
-          assert.same(200, status)
-          json = assert(cjson.decode(body))
-          assert.same(target.target, json.data[1].target)
-          assert.same("UNHEALTHY", json.data[1].health)
+
+          helpers.pwait_until(function ()
+            status, body = assert(client_send {
+              method = "GET",
+              path = "/upstreams/" .. upstream.id .. "/health"
+            })
+
+            assert.same(200, status)
+            json = assert(cjson.decode(body))
+            assert.same(target.target, json.data[1].target)
+            assert.same("UNHEALTHY", json.data[1].health)
+          end, 15)
+
         end)
       end)
     end
@@ -768,6 +915,8 @@ describe("Admin API #" .. strategy, function()
         assert.response(res).has.status(200)
         local json = assert.response(res).has.jsonbody()
         json.tags = nil
+        json.updated_at = nil
+        target.updated_at = nil
         assert.same(target, json)
       end)
     end)
@@ -794,17 +943,27 @@ describe("Admin API #" .. strategy, function()
       end)
 
       it("is allowed and works", function()
-        local res = client:patch("/upstreams/" .. upstream.name .. "/targets/" .. target.target, {
-          body = {
-            weight = 659,
-          },
-          headers = { ["Content-Type"] = "application/json" }
-        })
-        assert.response(res).has.status(200)
+        local admin_client = assert(helpers.admin_client())
+        local res
+        assert
+          .with_timeout(10)
+          .ignore_exceptions(true)
+          .eventually(function()
+            res = admin_client:patch("/upstreams/" .. upstream.name .. "/targets/" .. target.target, {
+              body = {
+                weight = 659,
+              },
+              headers = { ["Content-Type"] = "application/json" }
+            })
+            assert.response(res).has.status(200)
+          end)
+          .has_no_error()
         local json = assert.response(res).has.jsonbody()
         assert.is_string(json.id)
         assert.are.equal(target.target, json.target)
         assert.are.equal(659, json.weight)
+        assert.truthy(target.updated_at < json.updated_at)
+        admin_client:close()
 
         local res = assert(client:send {
           method = "GET",
@@ -853,6 +1012,8 @@ describe("Admin API #" .. strategy, function()
         assert.response(res).has.status(200)
         local json = assert.response(res).has.jsonbody()
         json.tags = nil
+        json.updated_at = nil
+        target.updated_at = nil
         assert.same(target, json)
       end)
 
@@ -967,6 +1128,34 @@ describe("Admin API #" .. strategy, function()
         assert.equal("api-1:80", json.data[1].target)
       end)
     end)
+  end)
+end)
+
+
+describe("/upstreams/{upstream}/targets/{target}/(un)healthy not available in hybrid mode", function()
+  lazy_setup(function()
+    assert(helpers.start_kong({
+      role = "control_plane",
+      cluster_cert = "spec/fixtures/kong_clustering.crt",
+      cluster_cert_key = "spec/fixtures/kong_clustering.key",
+      database = strategy,
+    }))
+  end)
+
+  lazy_teardown(function()
+    assert(helpers.stop_kong())
+  end)
+
+  it("healthcheck endpoints not included in /endpoints", function()
+    local admin_client = assert(helpers.admin_client())
+
+    local res = admin_client:get("/endpoints")
+    local body = assert.res_status(200, res)
+    local json = cjson.decode(body)
+    assert.is_nil(tablex.find(json.data, '/upstreams/{upstreams}/targets/{targets}/healthy'))
+    assert.is_nil(tablex.find(json.data, '/upstreams/{upstreams}/targets/{targets}/unhealthy'))
+    assert.is_nil(tablex.find(json.data, '/upstreams/{upstreams}/targets/{targets}/{address}/healthy'))
+    assert.is_nil(tablex.find(json.data, '/upstreams/{upstreams}/targets/{targets}/{address}/unhealthy'))
   end)
 end)
 

@@ -43,6 +43,7 @@ end
 return {
   name = "zipkin",
   fields = {
+    { protocols = typedefs.protocols },
     { config = {
         type = "record",
         fields = {
@@ -51,7 +52,7 @@ return {
           { sample_ratio = { type = "number",
                              default = 0.001,
                              between = { 0, 1 } } },
-                                        { default_service_name = { type = "string", default = nil } },
+          { default_service_name = { type = "string", default = nil } },
           { include_credential = { type = "boolean", required = true, default = true } },
           { traceid_byte_count = { type = "integer", required = true, default = 16, one_of = { 8, 16 } } },
           { header_type = { type = "string", required = true, default = "preserve",
@@ -65,6 +66,10 @@ return {
           { connect_timeout = typedefs.timeout { default = 2000 } },
           { send_timeout = typedefs.timeout { default = 5000 } },
           { read_timeout = typedefs.timeout { default = 5000 } },
+          { http_response_header_for_traceid = { type = "string", default = nil }},
+          { phase_duration_flavor = { type = "string", required = true, default = "annotations",
+                                      one_of = { "annotations", "tags" } } },
+          { queue = typedefs.queue },
         },
     }, },
   },

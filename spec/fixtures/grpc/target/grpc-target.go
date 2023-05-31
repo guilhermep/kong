@@ -7,9 +7,10 @@ import (
 	"net"
 	"time"
 
+	pb "target/targetservice"
+
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	pb "target/targetservice"
 )
 
 const (
@@ -22,7 +23,8 @@ type server struct {
 
 func (s *server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloResponse, error) {
 	return &pb.HelloResponse{
-		Reply: fmt.Sprintf("hello %s", in.GetGreeting()),
+		Reply:       fmt.Sprintf("hello %s", in.GetGreeting()),
+		BooleanTest: in.GetBooleanTest(),
 	}, nil
 }
 
@@ -44,6 +46,10 @@ func (s *server) BounceIt(ctx context.Context, in *pb.BallIn) (*pb.BallOut, erro
 func (s *server) GrowTail(ctx context.Context, in *pb.Body) (*pb.Body, error) {
 	in.Tail.Count += 1
 
+	return in, nil
+}
+
+func (s *server) Echo(ctx context.Context, in *pb.EchoMsg) (*pb.EchoMsg, error) {
 	return in, nil
 }
 

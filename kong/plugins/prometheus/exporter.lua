@@ -29,6 +29,62 @@ package.loaded['prometheus_resty_counter'] = require("resty.counter")
 
 
 local kong_subsystem = ngx.config.subsystem
+local http_subsystem = kong_subsystem == "http"
+
+
+-- should we introduce a way to know if a plugin is configured or not?
+local is_prometheus_enabled, register_events_handler do
+  local PLUGIN_NAME = "prometheus"
+  local CACHE_KEY = "prometheus:enabled"
+
+  local function is_prometheus_enabled_fetch()
+    for plugin, err in kong.db.plugins:each() do
+      if err then
+        kong.log.crit("could not obtain list of plugins: ", err)
+        return nil, err
+      end
+
+      if plugin.name == PLUGIN_NAME and plugin.enabled then
+        return true
+      end
+    end
+
+    return false
+  end
+
+
+  -- Returns `true` if Prometheus is enabled anywhere inside Kong.
+  -- The results are then cached and purged as necessary.
+  function is_prometheus_enabled()
+    local enabled, err = kong.cache:get(CACHE_KEY, nil, is_prometheus_enabled_fetch)
+
+    if err then
+      error("error when checking if prometheus enabled: " .. err)
+    end
+
+    return enabled
+  end
+
+
+  -- invalidate cache when a plugin is added/removed/updated
+  function register_events_handler()
+    local worker_events = kong.worker_events
+
+    if kong.configuration.database == "off" then
+      worker_events.register(function()
+        kong.cache:invalidate(CACHE_KEY)
+      end, "declarative", "reconfigure")
+
+    else
+      worker_events.register(function(data)
+        if data.entity.name == PLUGIN_NAME then
+          kong.cache:invalidate(CACHE_KEY)
+        end
+      end, "crud", "plugins")
+    end
+  end
+end
+
 
 local function init()
   local shm = "prometheus_metrics"
@@ -42,37 +98,59 @@ local function init()
   -- global metrics
   metrics.connections = prometheus:gauge("nginx_connections_total",
     "Number of connections by subsystem",
-    {"node_id", "subsystem", "state"})
+    {"node_id", "subsystem", "state"},
+    prometheus.LOCAL_STORAGE)
   metrics.nginx_requests_total = prometheus:gauge("nginx_requests_total",
-      "Number of requests total", {"node_id", "subsystem"})
+      "Number of requests total", {"node_id", "subsystem"},
+      prometheus.LOCAL_STORAGE)
   metrics.timers = prometheus:gauge("nginx_timers",
                                     "Number of nginx timers",
-                                    {"state"})
+                                    {"state"},
+                                    prometheus.LOCAL_STORAGE)
   metrics.db_reachable = prometheus:gauge("datastore_reachable",
                                           "Datastore reachable from Kong, " ..
-                                          "0 is unreachable")
+                                          "0 is unreachable",
+                                          nil,
+                                          prometheus.LOCAL_STORAGE)
   metrics.node_info = prometheus:gauge("node_info",
                                        "Kong Node metadata information",
-                                       {"node_id", "version"})
+                                       {"node_id", "version"},
+                                       prometheus.LOCAL_STORAGE)
+  metrics.node_info:set(1, {node_id, kong.version})
   -- only export upstream health metrics in traditional mode and data plane
   if role ~= "control_plane" then
     metrics.upstream_target_health = prometheus:gauge("upstream_target_health",
                                             "Health status of targets of upstream. " ..
                                             "States = healthchecks_off|healthy|unhealthy|dns_error, " ..
                                             "value is 1 when state is populated.",
-                                            {"upstream", "target", "address", "state", "subsystem"})
+                                            {"upstream", "target", "address", "state", "subsystem"},
+                                            prometheus.LOCAL_STORAGE)
   end
 
   local memory_stats = {}
   memory_stats.worker_vms = prometheus:gauge("memory_workers_lua_vms_bytes",
                                              "Allocated bytes in worker Lua VM",
-                                             {"node_id", "pid", "kong_subsystem"})
+                                             {"node_id", "pid", "kong_subsystem"},
+                                             prometheus.LOCAL_STORAGE)
   memory_stats.shms = prometheus:gauge("memory_lua_shared_dict_bytes",
-                                       "Allocated slabs in bytes in a shared_dict",
-                                       {"node_id", "shared_dict", "kong_subsystem"})
+                                             "Allocated slabs in bytes in a shared_dict",
+                                             {"node_id", "shared_dict", "kong_subsystem"},
+                                             prometheus.LOCAL_STORAGE)
   memory_stats.shm_capacity = prometheus:gauge("memory_lua_shared_dict_total_bytes",
-                                               "Total capacity in bytes of a shared_dict",
-                                               {"node_id", "shared_dict", "kong_subsystem"})
+                                                     "Total capacity in bytes of a shared_dict",
+                                                     {"node_id", "shared_dict", "kong_subsystem"},
+                                                     prometheus.LOCAL_STORAGE)
+
+  if kong.configuration.database == "off" then
+    memory_stats.lmdb = prometheus:gauge("memory_lmdb_used_bytes",
+                                         "Used bytes in LMDB",
+                                         {"node_id"},
+                                         prometheus.LOCAL_STORAGE)
+    memory_stats.lmdb_capacity = prometheus:gauge("memory_lmdb_total_bytes",
+                                                  "Total capacity in bytes of LMDB",
+                                                  {"node_id"},
+                                                  prometheus.LOCAL_STORAGE)
+  end
 
   local res = kong.node.get_memory_stats()
   for shm_name, value in pairs(res.lua_shared_dicts) do
@@ -82,13 +160,13 @@ local function init()
   metrics.memory_stats = memory_stats
 
   -- per service/route
-  if kong_subsystem == "http" then
+  if http_subsystem then
     metrics.status = prometheus:counter("http_requests_total",
                                         "HTTP status codes per consumer/service/route in Kong",
                                         {"service", "route", "code", "source", "consumer"})
   else
-    metrics.status = prometheus:counter("stream_status",
-                                        "Stream status codes per consumer/service/route in Kong",
+    metrics.status = prometheus:counter("stream_sessions_total",
+                                        "Stream status codes per service/route in Kong",
                                         {"service", "route", "code", "source"})
   end
   metrics.kong_latency = prometheus:histogram("kong_latency_ms",
@@ -103,7 +181,7 @@ local function init()
                                                   UPSTREAM_LATENCY_BUCKETS)
 
 
-  if kong_subsystem == "http" then
+  if http_subsystem then
     metrics.total_latency = prometheus:histogram("request_latency_ms",
                                                  "Total latency incurred during requests " ..
                                                  "for each service/route in Kong",
@@ -116,27 +194,40 @@ local function init()
                                                  {"service", "route"},
                                                  UPSTREAM_LATENCY_BUCKETS)
   end
-  metrics.bandwidth = prometheus:counter("bandwidth_bytes",
-                                         "Total bandwidth (ingress/egress) " ..
-                                         "throughput in bytes",
-                                         {"service", "route", "direction", "consumer"})
+
+  if http_subsystem then
+    metrics.bandwidth = prometheus:counter("bandwidth_bytes",
+                                          "Total bandwidth (ingress/egress) " ..
+                                          "throughput in bytes",
+                                          {"service", "route", "direction", "consumer"})
+  else -- stream has no consumer
+    metrics.bandwidth = prometheus:counter("bandwidth_bytes",
+                                          "Total bandwidth (ingress/egress) " ..
+                                          "throughput in bytes",
+                                          {"service", "route", "direction"})
+  end
 
   -- Hybrid mode status
   if role == "control_plane" then
     metrics.data_plane_last_seen = prometheus:gauge("data_plane_last_seen",
                                               "Last time data plane contacted control plane",
-                                              {"node_id", "hostname", "ip"})
+                                              {"node_id", "hostname", "ip"},
+                                              prometheus.LOCAL_STORAGE)
     metrics.data_plane_config_hash = prometheus:gauge("data_plane_config_hash",
                                               "Config hash numeric value of the data plane",
-                                              {"node_id", "hostname", "ip"})
+                                              {"node_id", "hostname", "ip"},
+                                              prometheus.LOCAL_STORAGE)
 
     metrics.data_plane_version_compatible = prometheus:gauge("data_plane_version_compatible",
                                               "Version compatible status of the data plane, 0 is incompatible",
-                                              {"node_id", "hostname", "ip", "kong_version"})
+                                              {"node_id", "hostname", "ip", "kong_version"},
+                                              prometheus.LOCAL_STORAGE)
   elseif role == "data_plane" then
     local data_plane_cluster_cert_expiry_timestamp = prometheus:gauge(
       "data_plane_cluster_cert_expiry_timestamp",
-      "Unix timestamp of Data Plane's cluster_cert expiry time")
+      "Unix timestamp of Data Plane's cluster_cert expiry time",
+      nil,
+      prometheus.LOCAL_STORAGE)
     -- The cluster_cert doesn't change once Kong starts.
     -- We set this metrics just once to avoid file read in each scrape.
     local f = assert(io.open(kong.configuration.cluster_cert))
@@ -151,6 +242,7 @@ end
 
 local function init_worker()
   prometheus:init_worker()
+  register_events_handler()
 end
 
 -- Convert the MD5 hex string to its numeric representation
@@ -162,9 +254,9 @@ end
 
 -- Since in the prometheus library we create a new table for each diverged label
 -- so putting the "more dynamic" label at the end will save us some memory
-local labels_table = {0, 0, 0, 0}
+local labels_table_bandwidth = {0, 0, 0, 0}
 local labels_table_status = {0, 0, 0, 0, 0}
-local latency_labels_table = {0, 0}
+local labels_table_latency = {0, 0}
 local upstream_target_addr_health_table = {
   { value = 0, labels = { 0, 0, 0, "healthchecks_off", ngx.config.subsystem } },
   { value = 0, labels = { 0, 0, 0, "healthy", ngx.config.subsystem } },
@@ -183,43 +275,58 @@ local function set_healthiness_metrics(table, upstream, target, address, status,
 end
 
 
-local log
+local function log(message, serialized)
+  if not metrics then
+    kong.log.err("prometheus: can not log metrics because of an initialization "
+            .. "error, please make sure that you've declared "
+            .. "'prometheus_metrics' shared dict in your nginx template")
+    return
+  end
 
-if kong_subsystem == "http" then
-  function log(message, serialized)
-    if not metrics then
-      kong.log.err("prometheus: can not log metrics because of an initialization "
-              .. "error, please make sure that you've declared "
-              .. "'prometheus_metrics' shared dict in your nginx template")
-      return
-    end
+  local service_name
+  if message and message.service then
+    service_name = message.service.name or message.service.host
+  else
+    -- do not record any stats if the service is not present
+    return
+  end
 
-    local service_name
-    if message and message.service then
-      service_name = message.service.name or message.service.host
-    else
-      -- do not record any stats if the service is not present
-      return
-    end
+  local route_name
+  if message and message.route then
+    route_name = message.route.name or message.route.id
+  end
 
-    local route_name
-    if message and message.route then
-      route_name = message.route.name or message.route.id
-    end
-
-    local consumer = ""
+  local consumer = ""
+  if http_subsystem then
     if message and serialized.consumer ~= nil then
       consumer = serialized.consumer
     end
+  else
+    consumer = nil -- no consumer in stream
+  end
 
-    labels_table[1] = service_name
-    labels_table[2] = route_name
-    labels_table[3] = message.response.status
-    labels_table[4] = consumer
+  if serialized.ingress_size or serialized.egress_size then
+    labels_table_bandwidth[1] = service_name
+    labels_table_bandwidth[2] = route_name
+    labels_table_bandwidth[4] = consumer
 
+    local ingress_size = serialized.ingress_size
+    if ingress_size and ingress_size > 0 then
+      labels_table_bandwidth[3] = "ingress"
+      metrics.bandwidth:inc(ingress_size, labels_table_bandwidth)
+    end
+
+    local egress_size = serialized.egress_size
+    if egress_size and egress_size > 0 then
+      labels_table_bandwidth[3] = "egress"
+      metrics.bandwidth:inc(egress_size, labels_table_bandwidth)
+    end
+  end
+
+  if serialized.status_code then
     labels_table_status[1] = service_name
     labels_table_status[2] = route_name
-    labels_table_status[3] = message.response.status
+    labels_table_status[3] = serialized.status_code
 
     if kong.response.get_source() == "service" then
       labels_table_status[4] = "service"
@@ -229,102 +336,49 @@ if kong_subsystem == "http" then
 
     labels_table_status[5] = consumer
 
-    latency_labels_table[1] = service_name
-    latency_labels_table[2] = route_name
-
     metrics.status:inc(1, labels_table_status)
-
-    local request_size = tonumber(message.request.size)
-    if request_size and request_size > 0 then
-      labels_table[3] = "ingress"
-      metrics.bandwidth:inc(request_size, labels_table)
-    end
-
-    local response_size = tonumber(message.response.size)
-    if response_size and response_size > 0 then
-      labels_table[3] = "egress"
-      metrics.bandwidth:inc(response_size, labels_table)
-    end
-
-    local request_latency = message.latencies.request
-    if request_latency and request_latency >= 0 then
-      metrics.total_latency:observe(request_latency, latency_labels_table)
-    end
-
-    local upstream_latency = message.latencies.proxy
-    if upstream_latency ~= nil and upstream_latency >= 0 then
-      metrics.upstream_latency:observe(upstream_latency, latency_labels_table)
-    end
-
-    local kong_proxy_latency = message.latencies.kong
-    if kong_proxy_latency ~= nil and kong_proxy_latency >= 0 then
-      metrics.kong_latency:observe(kong_proxy_latency, latency_labels_table)
-    end
-
   end
-else
-  function log(message, serialized)
-    if not metrics then
-      kong.log.err("prometheus: can not log metrics because of an initialization "
-              .. "error, please make sure that you've declared "
-              .. "'prometheus_metrics' shared dict in your nginx template")
-      return
-    end
 
-    local service_name
-    if message and message.service then
-      service_name = message.service.name or message.service.host
+  if serialized.latencies then
+    labels_table_latency[1] = service_name
+    labels_table_latency[2] = route_name
+
+    if http_subsystem then
+      local request_latency = serialized.latencies.request
+      if request_latency and request_latency >= 0 then
+        metrics.total_latency:observe(request_latency, labels_table_latency)
+      end
+
+      local upstream_latency = serialized.latencies.proxy
+      if upstream_latency ~= nil and upstream_latency >= 0 then
+        metrics.upstream_latency:observe(upstream_latency, labels_table_latency)
+      end
+
     else
-      -- do not record any stats if the service is not present
-      return
+      local session_latency = serialized.latencies.session
+      if session_latency and session_latency >= 0 then
+        metrics.total_latency:observe(session_latency, labels_table_latency)
+      end
     end
 
-    local route_name
-    if message and message.route then
-      route_name = message.route.name or message.route.id
-    end
-
-    labels_table[1] = service_name
-    labels_table[2] = route_name
-    labels_table[3] = message.session.status
-
-    if kong.response.get_source() == "service" then
-      labels_table[4] = "service"
-    else
-      labels_table[4] = "kong"
-    end
-
-    latency_labels_table[1] = service_name
-    latency_labels_table[2] = route_name
-
-    metrics.status:inc(1, labels_table)
-
-    local ingress_size = tonumber(message.session.received)
-    if ingress_size and ingress_size > 0 then
-      labels_table[3] = "ingress"
-      metrics.bandwidth:inc(ingress_size, labels_table)
-    end
-
-    local egress_size = tonumber(message.session.sent)
-    if egress_size and egress_size > 0 then
-      labels_table[3] = "egress"
-      metrics.bandwidth:inc(egress_size, labels_table)
-    end
-
-    local session_latency = message.latencies.session
-    if session_latency and session_latency >= 0 then
-      metrics.total_latency:observe(session_latency, latency_labels_table)
-    end
-
-    local kong_proxy_latency = message.latencies.kong
+    local kong_proxy_latency = serialized.latencies.kong
     if kong_proxy_latency ~= nil and kong_proxy_latency >= 0 then
-      metrics.kong_latency:observe(kong_proxy_latency, latency_labels_table)
+      metrics.kong_latency:observe(kong_proxy_latency, labels_table_latency)
     end
   end
 end
 
+-- The upstream health metrics is turned on if at least one of
+-- the plugin turns upstream_health_metrics on.
+-- Due to the fact that during scrape time we don't want to
+-- iterrate over all plugins to find out if upstream_health_metrics
+-- is turned on or not, we will need a Kong reload if someone
+-- turned on upstream_health_metrics on and off again, to actually
+-- stop exporting upstream health metrics
+local should_export_upstream_health_metrics = false
 
-local function metric_data()
+
+local function metric_data(write_fn)
   if not prometheus or not metrics then
     kong.log.err("prometheus: plugin is not initialized, please make sure ",
                  " 'prometheus_metrics' shared dict is present in nginx template")
@@ -339,27 +393,27 @@ local function metric_data()
   metrics.connections:set(nginx_statistics['connections_reading'], { node_id, kong_subsystem, "reading" })
   metrics.connections:set(nginx_statistics['connections_writing'], { node_id, kong_subsystem, "writing" })
   metrics.connections:set(nginx_statistics['connections_waiting'], { node_id, kong_subsystem,"waiting" })
-  metrics.connections:set(nginx_statistics['connections_accepted'], { node_id, kong_subsystem, "accepted" })
-  metrics.connections:set(nginx_statistics['connections_handled'], { node_id, kong_subsystem, "handled" })
 
   metrics.nginx_requests_total:set(nginx_statistics['total_requests'], { node_id, kong_subsystem })
 
-  metrics.timers:set(ngx_timer_running_count(), {"running"})
-  metrics.timers:set(ngx_timer_pending_count(), {"pending"})
+  if http_subsystem then -- only export those metrics once in http as they are shared
+    metrics.timers:set(ngx_timer_running_count(), {"running"})
+    metrics.timers:set(ngx_timer_pending_count(), {"pending"})
 
-  -- db reachable?
-  local ok, err = kong.db.connector:connect()
-  if ok then
-    metrics.db_reachable:set(1)
+    -- db reachable?
+    local ok, err = kong.db.connector:connect()
+    if ok then
+      metrics.db_reachable:set(1)
 
-  else
-    metrics.db_reachable:set(0)
-    kong.log.err("prometheus: failed to reach database while processing",
-                 "/metrics endpoint: ", err)
+    else
+      metrics.db_reachable:set(0)
+      kong.log.err("prometheus: failed to reach database while processing",
+                  "/metrics endpoint: ", err)
+    end
   end
 
   -- only export upstream health metrics in traditional mode and data plane
-  if role ~= "control_plane" then
+  if role ~= "control_plane" and should_export_upstream_health_metrics then
     -- erase all target/upstream metrics, prevent exposing old metrics
     metrics.upstream_target_health:reset()
 
@@ -369,8 +423,7 @@ local function metric_data()
       local _, upstream_name = key:match("^([^:]*):(.-)$")
       upstream_name = upstream_name and upstream_name or key
       -- based on logic from kong.db.dao.targets
-      local health_info
-      health_info, err = balancer.get_upstream_health(upstream_id)
+      local health_info, err = balancer.get_upstream_health(upstream_id)
       if err then
         kong.log.err("failed getting upstream health: ", err)
       end
@@ -404,11 +457,17 @@ local function metric_data()
                                         { node_id, res.workers_lua_vms[i].pid, kong_subsystem })
   end
 
+  if kong.configuration.database == "off" then
+    metrics.memory_stats.lmdb_capacity:set(res.lmdb.map_size, { node_id })
+    metrics.memory_stats.lmdb:set(res.lmdb.used_size, { node_id })
+  end
+
   -- Hybrid mode status
   if role == "control_plane" then
     -- Cleanup old metrics
     metrics.data_plane_last_seen:reset()
     metrics.data_plane_config_hash:reset()
+    metrics.data_plane_version_compatible:reset()
 
     for data_plane, err in kong.db.clustering_data_planes:each() do
       if err then
@@ -436,13 +495,15 @@ local function metric_data()
     end
   end
 
-  return prometheus:metric_data()
+  -- notify the function if prometheus plugin is enabled,
+  -- so that it can avoid exporting unnecessary metrics if not
+  prometheus:metric_data(write_fn, not is_prometheus_enabled())
 end
 
-local function collect(with_stream)
+local function collect()
   ngx.header["Content-Type"] = "text/plain; charset=UTF-8"
 
-  ngx.print(metric_data())
+  metric_data()
 
   -- only gather stream metrics if stream_api module is available
   -- and user has configured at least one stream listeners
@@ -464,6 +525,11 @@ local function get_prometheus()
   return prometheus
 end
 
+local function set_export_upstream_health_metrics(set_or_not)
+  should_export_upstream_health_metrics = set_or_not
+end
+
+
 return {
   init        = init,
   init_worker = init_worker,
@@ -471,4 +537,5 @@ return {
   metric_data = metric_data,
   collect     = collect,
   get_prometheus = get_prometheus,
+  set_export_upstream_health_metrics = set_export_upstream_health_metrics,
 }

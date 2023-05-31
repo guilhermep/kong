@@ -4,46 +4,65 @@ local meta         = require "kong.meta"
 local utils        = require "kong.tools.utils"
 local Router       = require "kong.router"
 local balancer     = require "kong.runloop.balancer"
+local events       = require "kong.runloop.events"
 local reports      = require "kong.reports"
 local constants    = require "kong.constants"
 local certificate  = require "kong.runloop.certificate"
 local concurrency  = require "kong.concurrency"
-local workspaces   = require "kong.workspaces"
 local lrucache     = require "resty.lrucache"
-
+local marshall     = require "kong.cache.marshall"
+local ktls         = require "resty.kong.tls"
+local cjson        = require "cjson"
 
 local PluginsIterator = require "kong.runloop.plugins_iterator"
 local instrumentation = require "kong.tracing.instrumentation"
 
 
-local kong         = kong
-local type         = type
-local ipairs       = ipairs
-local tostring     = tostring
-local tonumber     = tonumber
-local setmetatable = setmetatable
-local sub          = string.sub
-local byte         = string.byte
-local gsub         = string.gsub
-local find         = string.find
-local lower        = string.lower
-local fmt          = string.format
-local ngx          = ngx
-local var          = ngx.var
-local log          = ngx.log
-local exit         = ngx.exit
-local exec         = ngx.exec
-local header       = ngx.header
-local timer_at     = ngx.timer.at
-local subsystem    = ngx.config.subsystem
-local clear_header = ngx.req.clear_header
-local http_version = ngx.req.http_version
-local unpack       = unpack
-local escape       = require("kong.tools.uri").escape
+local kong              = kong
+local type              = type
+local ipairs            = ipairs
+local tostring          = tostring
+local tonumber          = tonumber
+local setmetatable      = setmetatable
+local max               = math.max
+local min               = math.min
+local ceil              = math.ceil
+local sub               = string.sub
+local byte              = string.byte
+local gsub              = string.gsub
+local find              = string.find
+local lower             = string.lower
+local fmt               = string.format
+local ngx               = ngx
+local var               = ngx.var
+local log               = ngx.log
+local exit              = ngx.exit
+local exec              = ngx.exec
+local header            = ngx.header
+local timer_at          = ngx.timer.at
+local subsystem         = ngx.config.subsystem
+local clear_header      = ngx.req.clear_header
+local http_version      = ngx.req.http_version
+local escape            = require("kong.tools.uri").escape
 
 
 local is_http_module   = subsystem == "http"
 local is_stream_module = subsystem == "stream"
+
+local LOG_LEVELS                  = require("kong.constants").LOG_LEVELS
+local DEFAULT_MATCH_LRUCACHE_SIZE = Router.DEFAULT_MATCH_LRUCACHE_SIZE
+
+
+local kong_shm          = ngx.shared.kong
+local PLUGINS_REBUILD_COUNTER_KEY =
+                                constants.PLUGINS_REBUILD_COUNTER_KEY
+local ROUTERS_REBUILD_COUNTER_KEY =
+                                constants.ROUTERS_REBUILD_COUNTER_KEY
+
+
+local ROUTER_CACHE_SIZE = DEFAULT_MATCH_LRUCACHE_SIZE
+local ROUTER_CACHE = lrucache.new(ROUTER_CACHE_SIZE)
+local ROUTER_CACHE_NEG = lrucache.new(ROUTER_CACHE_SIZE)
 
 
 local NOOP = function() end
@@ -53,65 +72,55 @@ local ERR   = ngx.ERR
 local CRIT  = ngx.CRIT
 local NOTICE = ngx.NOTICE
 local WARN  = ngx.WARN
+local INFO  = ngx.INFO
 local DEBUG = ngx.DEBUG
 local COMMA = byte(",")
 local SPACE = byte(" ")
 local QUESTION_MARK = byte("?")
 local ARRAY_MT = require("cjson.safe").array_mt
 
-
 local HOST_PORTS = {}
 
 
 local SUBSYSTEMS = constants.PROTOCOLS_WITH_SUBSYSTEM
-local CLEAR_HEALTH_STATUS_DELAY = constants.CLEAR_HEALTH_STATUS_DELAY
 local TTL_ZERO = { ttl = 0 }
 
 
+local ROUTER
+local ROUTER_VERSION
 local ROUTER_SYNC_OPTS
+
+local PLUGINS_ITERATOR
 local PLUGINS_ITERATOR_SYNC_OPTS
-local FLIP_CONFIG_OPTS
+
+local RECONFIGURE_OPTS
 local GLOBAL_QUERY_OPTS = { workspace = ngx.null, show_ws_id = true }
 
-
-local get_plugins_iterator, get_updated_plugins_iterator
-local build_plugins_iterator, update_plugins_iterator
-local rebuild_plugins_iterator
-
-local get_updated_router, build_router, update_router
-local server_header = meta._SERVER_TOKENS
-local rebuild_router
-
-local stream_tls_terminate_sock = "unix:" .. ngx.config.prefix() .. "/stream_tls_terminate.sock"
-local stream_tls_passthrough_sock = "unix:" .. ngx.config.prefix() .. "/stream_tls_passthrough.sock"
-
--- for tests
-local _set_update_plugins_iterator
-local _set_update_router
-local _set_build_router
-local _set_router
-local _set_router_version
-local _register_balancer_events
+local SERVER_HEADER = meta._SERVER_TOKENS
 
 
-local set_upstream_cert_and_key
-local set_upstream_ssl_verify
-local set_upstream_ssl_verify_depth
-local set_upstream_ssl_trusted_store
+local STREAM_TLS_TERMINATE_SOCK
+local STREAM_TLS_PASSTHROUGH_SOCK
+
+
 local set_authority
+local set_log_level
+local get_log_level
+local set_upstream_cert_and_key = ktls.set_upstream_cert_and_key
+local set_upstream_ssl_verify = ktls.set_upstream_ssl_verify
+local set_upstream_ssl_verify_depth = ktls.set_upstream_ssl_verify_depth
+local set_upstream_ssl_trusted_store = ktls.set_upstream_ssl_trusted_store
+
 if is_http_module then
-  local tls = require("resty.kong.tls")
-  set_upstream_cert_and_key = tls.set_upstream_cert_and_key
-  set_upstream_ssl_verify = tls.set_upstream_ssl_verify
-  set_upstream_ssl_verify_depth = tls.set_upstream_ssl_verify_depth
-  set_upstream_ssl_trusted_store = tls.set_upstream_ssl_trusted_store
   set_authority = require("resty.kong.grpc").set_authority
+  set_log_level = require("resty.kong.log").set_log_level
+  get_log_level = require("resty.kong.log").get_log_level
 end
 
 
 local disable_proxy_ssl
 if is_stream_module then
-  disable_proxy_ssl = require("resty.kong.tls").disable_proxy_ssl
+  disable_proxy_ssl = ktls.disable_proxy_ssl
 end
 
 
@@ -204,350 +213,6 @@ local function csv(s)
 end
 
 
-local function register_balancer_events(core_cache, worker_events, cluster_events)
-  -- target updates
-
-
-  -- worker_events local handler: event received from DAO
-  worker_events.register(function(data)
-    local operation = data.operation
-    local target = data.entity
-    -- => to worker_events node handler
-    local ok, err = worker_events.post("balancer", "targets", {
-        operation = operation,
-        entity = target,
-      })
-    if not ok then
-      log(ERR, "failed broadcasting target ",
-        operation, " to workers: ", err)
-    end
-    -- => to cluster_events handler
-    local key = fmt("%s:%s", operation, target.upstream.id)
-    ok, err = cluster_events:broadcast("balancer:targets", key)
-    if not ok then
-      log(ERR, "failed broadcasting target ", operation, " to cluster: ", err)
-    end
-  end, "crud", "targets")
-
-
-  -- worker_events node handler
-  worker_events.register(function(data)
-    local operation = data.operation
-    local target = data.entity
-
-    -- => to balancer update
-    balancer.on_target_event(operation, target)
-  end, "balancer", "targets")
-
-
-  -- cluster_events handler
-  cluster_events:subscribe("balancer:targets", function(data)
-    local operation, key = unpack(utils.split(data, ":"))
-    local entity
-    if key ~= "all" then
-      entity = {
-        upstream = { id = key },
-      }
-    else
-      entity = "all"
-    end
-    -- => to worker_events node handler
-    local ok, err = worker_events.post("balancer", "targets", {
-        operation = operation,
-        entity = entity
-      })
-    if not ok then
-      log(ERR, "failed broadcasting target ", operation, " to workers: ", err)
-    end
-  end)
-
-
-  -- manual health updates
-  cluster_events:subscribe("balancer:post_health", function(data)
-    local pattern = "([^|]+)|([^|]*)|([^|]+)|([^|]+)|([^|]+)|(.*)"
-    local hostname, ip, port, health, id, name = data:match(pattern)
-    port = tonumber(port)
-    local upstream = { id = id, name = name }
-    if ip == "" then
-      ip = nil
-    end
-    local _, err = balancer.post_health(upstream, hostname, ip, port, health == "1")
-    if err then
-      log(ERR, "failed posting health of ", name, " to workers: ", err)
-    end
-  end)
-
-
-  -- upstream updates
-
-
-  -- worker_events local handler: event received from DAO
-  worker_events.register(function(data)
-    local operation = data.operation
-    local upstream = data.entity
-    local ws_id = workspaces.get_workspace_id()
-    if not upstream.ws_id then
-      log(DEBUG, "Event crud ", operation, " for upstream ", upstream.id,
-          " received without ws_id, adding.")
-      upstream.ws_id = ws_id
-    end
-    -- => to worker_events node handler
-    local ok, err = worker_events.post("balancer", "upstreams", {
-        operation = operation,
-        entity = upstream,
-      })
-    if not ok then
-      log(ERR, "failed broadcasting upstream ",
-        operation, " to workers: ", err)
-    end
-    -- => to cluster_events handler
-    local key = fmt("%s:%s:%s:%s", operation, data.entity.ws_id, upstream.id, upstream.name)
-    local ok, err = cluster_events:broadcast("balancer:upstreams", key)
-    if not ok then
-      log(ERR, "failed broadcasting upstream ", operation, " to cluster: ", err)
-    end
-  end, "crud", "upstreams")
-
-
-  -- worker_events node handler
-  worker_events.register(function(data)
-    local operation = data.operation
-    local upstream = data.entity
-
-    if not upstream.ws_id then
-      log(CRIT, "Operation ", operation, " for upstream ", upstream.id,
-          " received without workspace, discarding.")
-      return
-    end
-
-    core_cache:invalidate_local("balancer:upstreams")
-    core_cache:invalidate_local("balancer:upstreams:" .. upstream.id)
-
-    -- => to balancer update
-    balancer.on_upstream_event(operation, upstream)
-  end, "balancer", "upstreams")
-
-
-  cluster_events:subscribe("balancer:upstreams", function(data)
-    local operation, ws_id, id, name = unpack(utils.split(data, ":"))
-    local entity = {
-      id = id,
-      name = name,
-      ws_id = ws_id,
-    }
-    -- => to worker_events node handler
-    local ok, err = worker_events.post("balancer", "upstreams", {
-        operation = operation,
-        entity = entity
-      })
-    if not ok then
-      log(ERR, "failed broadcasting upstream ", operation, " to workers: ", err)
-    end
-  end)
-end
-
-
-local function register_events()
-  -- initialize local local_events hooks
-  local db             = kong.db
-  local core_cache     = kong.core_cache
-  local worker_events  = kong.worker_events
-  local cluster_events = kong.cluster_events
-
-  if db.strategy == "off" then
-
-    -- declarative config updates
-
-    local current_router_hash
-    local current_plugins_hash
-    local current_balancer_hash
-
-    worker_events.register(function(data)
-      if ngx.worker.exiting() then
-        log(NOTICE, "declarative reconfigure canceled: process exiting")
-        return true
-      end
-
-      local default_ws
-      local router_hash
-      local plugins_hash
-      local balancer_hash
-
-      if type(data) == "table" then
-        default_ws = data[1]
-        router_hash = data[2]
-        plugins_hash = data[3]
-        balancer_hash = data[4]
-      end
-
-      local ok, err = concurrency.with_coroutine_mutex(FLIP_CONFIG_OPTS, function()
-        local rebuild_balancer = balancer_hash == nil or balancer_hash ~= current_balancer_hash
-        if rebuild_balancer then
-          balancer.stop_healthcheckers(CLEAR_HEALTH_STATUS_DELAY)
-        end
-
-        kong.core_cache:purge()
-        kong.cache:purge()
-
-        balancer.stop_healthcheckers(CLEAR_HEALTH_STATUS_DELAY)
-
-        kong.default_workspace = default_ws
-        ngx.ctx.workspace = kong.default_workspace
-
-        if plugins_hash == nil or plugins_hash ~= current_plugins_hash then
-          rebuild_plugins_iterator(PLUGINS_ITERATOR_SYNC_OPTS)
-          current_plugins_hash = plugins_hash
-        end
-
-        if router_hash == nil or router_hash ~= current_router_hash then
-          rebuild_router(ROUTER_SYNC_OPTS)
-          current_router_hash = router_hash
-        end
-
-        if rebuild_balancer then
-          balancer.init()
-          current_balancer_hash = balancer_hash
-        end
-
-        return true
-      end)
-
-      if not ok then
-        log(ERR, "config flip failed: ", err)
-      end
-    end, "declarative", "reconfigure")
-
-    return
-  end
-
-  -- events dispatcher
-
-  worker_events.register(function(data)
-    if not data.schema then
-      log(ERR, "[events] missing schema in crud subscriber")
-      return
-    end
-
-    if not data.entity then
-      log(ERR, "[events] missing entity in crud subscriber")
-      return
-    end
-
-    -- invalidate this entity anywhere it is cached if it has a
-    -- caching key
-
-    local cache_key = db[data.schema.name]:cache_key(data.entity)
-    local cache_obj = kong[constants.ENTITY_CACHE_STORE[data.schema.name]]
-
-    if cache_key then
-      cache_obj:invalidate(cache_key)
-    end
-
-    -- if we had an update, but the cache key was part of what was updated,
-    -- we need to invalidate the previous entity as well
-
-    if data.old_entity then
-      local old_cache_key = db[data.schema.name]:cache_key(data.old_entity)
-      if old_cache_key and cache_key ~= old_cache_key then
-        cache_obj:invalidate(old_cache_key)
-      end
-    end
-
-    if not data.operation then
-      log(ERR, "[events] missing operation in crud subscriber")
-      return
-    end
-
-    -- public worker events propagation
-
-    local entity_channel           = data.schema.table or data.schema.name
-    local entity_operation_channel = fmt("%s:%s", entity_channel,
-      data.operation)
-
-    -- crud:routes
-    local ok, err = worker_events.post_local("crud", entity_channel, data)
-    if not ok then
-      log(ERR, "[events] could not broadcast crud event: ", err)
-      return
-    end
-
-    -- crud:routes:create
-    ok, err = worker_events.post_local("crud", entity_operation_channel, data)
-    if not ok then
-      log(ERR, "[events] could not broadcast crud event: ", err)
-      return
-    end
-  end, "dao:crud")
-
-
-  -- local events (same worker)
-
-
-  worker_events.register(function()
-    log(DEBUG, "[events] Route updated, invalidating router")
-    core_cache:invalidate("router:version")
-  end, "crud", "routes")
-
-
-  worker_events.register(function(data)
-    if data.operation ~= "create" and
-      data.operation ~= "delete"
-      then
-      -- no need to rebuild the router if we just added a Service
-      -- since no Route is pointing to that Service yet.
-      -- ditto for deletion: if a Service if being deleted, it is
-      -- only allowed because no Route is pointing to it anymore.
-      log(DEBUG, "[events] Service updated, invalidating router")
-      core_cache:invalidate("router:version")
-    end
-  end, "crud", "services")
-
-
-  worker_events.register(function(data)
-    log(DEBUG, "[events] Plugin updated, invalidating plugins iterator")
-    core_cache:invalidate("plugins_iterator:version")
-  end, "crud", "plugins")
-
-
-  -- SSL certs / SNIs invalidations
-
-
-  worker_events.register(function(data)
-    log(DEBUG, "[events] SNI updated, invalidating cached certificates")
-    local sni = data.old_entity or data.entity
-    local sni_wild_pref, sni_wild_suf = certificate.produce_wild_snis(sni.name)
-    core_cache:invalidate("snis:" .. sni.name)
-
-    if sni_wild_pref then
-      core_cache:invalidate("snis:" .. sni_wild_pref)
-    end
-
-    if sni_wild_suf then
-      core_cache:invalidate("snis:" .. sni_wild_suf)
-    end
-  end, "crud", "snis")
-
-
-  worker_events.register(function(data)
-    log(DEBUG, "[events] SSL cert updated, invalidating cached certificates")
-    local certificate = data.entity
-
-    for sni, err in db.snis:each_for_certificate({ id = certificate.id }, nil, GLOBAL_QUERY_OPTS) do
-      if err then
-        log(ERR, "[events] could not find associated snis for certificate: ",
-          err)
-        break
-      end
-
-      local cache_key = "certificates:" .. sni.certificate.id
-      core_cache:invalidate(cache_key)
-    end
-  end, "crud", "certificates")
-
-  register_balancer_events(core_cache, worker_events, cluster_events)
-end
-
-
 -- @param name "router" or "plugins_iterator"
 -- @param callback A function that will update the router or plugins_iterator
 -- @param version target version
@@ -558,8 +223,7 @@ end
 -- or an error happened).
 -- @returns error message as a second return value in case of failure/error
 local function rebuild(name, callback, version, opts)
-  local current_version, err = kong.core_cache:get(name .. ":version", TTL_ZERO,
-                                                   utils.uuid)
+  local current_version, err = kong.core_cache:get(name .. ":version", TTL_ZERO, utils.uuid)
   if err then
     return nil, "failed to retrieve " .. name .. " version: " .. err
   end
@@ -572,323 +236,472 @@ local function rebuild(name, callback, version, opts)
 end
 
 
-do
-  local plugins_iterator
-
-
-  build_plugins_iterator = function(version)
-    local new_iterator, err = PluginsIterator.new(version)
-    if not new_iterator then
-      return nil, err
-    end
-    plugins_iterator = new_iterator
-    return true
-  end
-
-
-  update_plugins_iterator = function()
-    local version, err = kong.core_cache:get("plugins_iterator:version", TTL_ZERO,
-                                             utils.uuid)
-    if err then
-      return nil, "failed to retrieve plugins iterator version: " .. err
-    end
-
-    if plugins_iterator and plugins_iterator.version == version then
+-- Given a protocol, return the subsystem that handles it
+local function should_process_route(route)
+  for _, protocol in ipairs(route.protocols) do
+    if SUBSYSTEMS[protocol] == subsystem then
       return true
     end
-
-    local ok, err = build_plugins_iterator(version)
-    if not ok then
-      return nil, --[[ 'err' fully formatted ]] err
-    end
-
-    return true
   end
 
-
-  rebuild_plugins_iterator = function(timeout)
-    local plugins_iterator_version = plugins_iterator and plugins_iterator.version
-    return rebuild("plugins_iterator", update_plugins_iterator,
-                   plugins_iterator_version, timeout)
-  end
-
-
-  get_updated_plugins_iterator = function()
-    if kong.db.strategy ~= "off" and kong.configuration.worker_consistency == "strict" then
-      local ok, err = rebuild_plugins_iterator(PLUGINS_ITERATOR_SYNC_OPTS)
-      if not ok then
-        -- If an error happens while updating, log it and return non-updated
-        -- version
-        log(ERR, "could not rebuild plugins iterator: ", err,
-                 " (stale plugins iterator will be used)")
-      end
-    end
-    return plugins_iterator
-  end
-
-
-  get_plugins_iterator = function()
-    return plugins_iterator
-  end
-
-
-  -- for tests only
-  _set_update_plugins_iterator = function(f)
-    update_plugins_iterator = f
-  end
+  return false
 end
 
 
-do
-  local router
-  local router_version
-  local router_cache = lrucache.new(Router.MATCH_LRUCACHE_SIZE)
-  local router_cache_neg = lrucache.new(Router.MATCH_LRUCACHE_SIZE)
+local function load_service_from_db(service_pk)
+  local service, err = kong.db.services:select(service_pk, GLOBAL_QUERY_OPTS)
+  if service == nil then
+    -- the third value means "do not cache"
+    return nil, err, -1
+  end
+  return service
+end
 
 
-  -- Given a protocol, return the subsystem that handles it
-  local function should_process_route(route)
-    for _, protocol in ipairs(route.protocols) do
-      if SUBSYSTEMS[protocol] == subsystem then
-        return true
-      end
-    end
-
-    return false
+local function build_services_init_cache(db)
+  local services_init_cache = {}
+  local services = db.services
+  local page_size
+  if services.pagination then
+    page_size = services.pagination.max_page_size
   end
 
-
-  local function load_service_from_db(service_pk)
-    local service, err = kong.db.services:select(service_pk, GLOBAL_QUERY_OPTS)
-    if service == nil then
-      -- the third value means "do not cache"
-      return nil, err, -1
+  for service, err in services:each(page_size, GLOBAL_QUERY_OPTS) do
+    if err then
+      return nil, err
     end
+
+    services_init_cache[service.id] = service
+  end
+
+  return services_init_cache
+end
+
+
+local function get_service_for_route(db, route, services_init_cache)
+  local service_pk = route.service
+  if not service_pk then
+    return nil
+  end
+
+  local id = service_pk.id
+  local service = services_init_cache[id]
+  if service then
     return service
   end
 
+  local err
 
-  local function build_services_init_cache(db)
-    local services_init_cache = {}
-    local services = db.services
-    local page_size
-    if services.pagination then
-      page_size = services.pagination.max_page_size
+  -- kong.core_cache is available, not in init phase
+  if kong.core_cache and db.strategy ~= "off" then
+    local cache_key = db.services:cache_key(service_pk.id, nil, nil, nil, nil,
+                                            route.ws_id)
+    service, err = kong.core_cache:get(cache_key, TTL_ZERO,
+                                       load_service_from_db, service_pk)
+
+  else -- dbless or init phase, kong.core_cache not needed/available
+
+    -- A new service/route has been inserted while the initial route
+    -- was being created, on init (perhaps by a different Kong node).
+    -- Load the service individually and update services_init_cache with it
+    service, err = load_service_from_db(service_pk)
+    services_init_cache[id] = service
+  end
+
+  if err then
+    return nil, "error raised while finding service for route (" .. route.id .. "): " ..
+                err
+
+  elseif not service then
+    return nil, "could not find service for route (" .. route.id .. ")"
+  end
+
+
+  -- TODO: this should not be needed as the schema should check it already
+  if SUBSYSTEMS[service.protocol] ~= subsystem then
+    log(WARN, "service with protocol '", service.protocol,
+              "' cannot be used with '", subsystem, "' subsystem")
+
+    return nil
+  end
+
+  return service
+end
+
+
+local function get_router_version()
+  return kong.core_cache:get("router:version", TTL_ZERO, utils.uuid)
+end
+
+
+local function new_router(version)
+  local db = kong.db
+  local routes, i = {}, 0
+
+  local err
+  -- The router is initially created on init phase, where kong.core_cache is
+  -- still not ready. For those cases, use a plain Lua table as a cache
+  -- instead
+  local services_init_cache = {}
+  if not kong.core_cache and db.strategy ~= "off" then
+    services_init_cache, err = build_services_init_cache(db)
+    if err then
+      services_init_cache = {}
+      log(WARN, "could not build services init cache: ", err)
+    end
+  end
+
+  local detect_changes = db.strategy ~= "off" and kong.core_cache
+  local counter = 0
+  local page_size = db.routes.pagination.max_page_size
+  for route, err in db.routes:each(page_size, GLOBAL_QUERY_OPTS) do
+    if err then
+      return nil, "could not load routes: " .. err
     end
 
-    for service, err in services:each(page_size, GLOBAL_QUERY_OPTS) do
+    if detect_changes then
+      if counter > 0 and counter % page_size == 0 then
+        local new_version, err = get_router_version()
+        if err then
+          return nil, "failed to retrieve router version: " .. err
+        end
+
+        if new_version ~= version then
+          return nil, "router was changed while rebuilding it"
+        end
+      end
+      counter = counter + 1
+    end
+
+    if should_process_route(route) then
+      local service, err = get_service_for_route(db, route, services_init_cache)
       if err then
         return nil, err
       end
 
-      services_init_cache[service.id] = service
-    end
+      -- routes with no services are added to router
+      -- but routes where the services.enabled == false are not put in router
+      if service == nil or service.enabled ~= false then
+        local r = {
+          route   = route,
+          service = service,
+        }
 
-    return services_init_cache
+        i = i + 1
+        routes[i] = r
+      end
+    end
   end
 
+  local n = DEFAULT_MATCH_LRUCACHE_SIZE
+  local cache_size = min(ceil(max(i / n, 1)) * n, n * 20)
 
-  local function get_service_for_route(db, route, services_init_cache)
-    local service_pk = route.service
-    if not service_pk then
-      return nil
-    end
-
-    local id = service_pk.id
-    local service = services_init_cache[id]
-    if service then
-      return service
-    end
-
-    local err
-
-    -- kong.core_cache is available, not in init phase
-    if kong.core_cache then
-      local cache_key = db.services:cache_key(service_pk.id, nil, nil, nil, nil,
-                                              route.ws_id)
-      service, err = kong.core_cache:get(cache_key, TTL_ZERO,
-                                    load_service_from_db, service_pk)
-
-    else -- init phase, kong.core_cache not available
-
-      -- A new service/route has been inserted while the initial route
-      -- was being created, on init (perhaps by a different Kong node).
-      -- Load the service individually and update services_init_cache with it
-      service, err = load_service_from_db(service_pk)
-      services_init_cache[id] = service
-    end
-
-    if err then
-      return nil, "error raised while finding service for route (" .. route.id .. "): " ..
-                  err
-
-    elseif not service then
-      return nil, "could not find service for route (" .. route.id .. ")"
-    end
-
-
-    -- TODO: this should not be needed as the schema should check it already
-    if SUBSYSTEMS[service.protocol] ~= subsystem then
-      log(WARN, "service with protocol '", service.protocol,
-                "' cannot be used with '", subsystem, "' subsystem")
-
-      return nil
-    end
-
-    return service
+  if cache_size ~= ROUTER_CACHE_SIZE then
+    ROUTER_CACHE = lrucache.new(cache_size)
+    ROUTER_CACHE_SIZE = cache_size
   end
 
-
-  local function get_router_version()
-    return kong.core_cache:get("router:version", TTL_ZERO, utils.uuid)
+  local new_router, err = Router.new(routes, ROUTER_CACHE, ROUTER_CACHE_NEG, ROUTER)
+  if not new_router then
+    return nil, "could not create router: " .. err
   end
 
+  local _, err = kong_shm:incr(ROUTERS_REBUILD_COUNTER_KEY, 1, 0)
+  if err then
+    log(ERR, "failed to increase router rebuild counter: ", err)
+  end
 
-  build_router = function(version)
-    local db = kong.db
-    local routes, i = {}, 0
+  return new_router
+end
 
-    local err
-    -- The router is initially created on init phase, where kong.core_cache is
-    -- still not ready. For those cases, use a plain Lua table as a cache
-    -- instead
-    local services_init_cache = {}
-    if not kong.core_cache and db.strategy ~= "off" then
-      services_init_cache, err = build_services_init_cache(db)
-      if err then
-        services_init_cache = {}
-        log(WARN, "could not build services init cache: ", err)
-      end
-    end
 
-    local counter = 0
-    local page_size = db.routes.pagination.max_page_size
-    for route, err in db.routes:each(page_size, GLOBAL_QUERY_OPTS) do
-      if err then
-        return nil, "could not load routes: " .. err
-      end
+local function build_router(version)
+  local router, err = new_router(version)
+  if not router then
+    return nil, err
+  end
 
-      if db.strategy ~= "off" then
-        if kong.core_cache and counter > 0 and counter % page_size == 0 then
-          local new_version, err = get_router_version()
-          if err then
-            return nil, "failed to retrieve router version: " .. err
-          end
+  ROUTER = router
 
-          if new_version ~= version then
-            return nil, "router was changed while rebuilding it"
-          end
-        end
-      end
+  if version then
+    ROUTER_VERSION = version
+  end
 
-      if should_process_route(route) then
-        local service, err = get_service_for_route(db, route, services_init_cache)
-        if err then
-          return nil, err
-        end
+  ROUTER_CACHE:flush_all()
+  ROUTER_CACHE_NEG:flush_all()
 
-        -- routes with no services are added to router
-        -- but routes where the services.enabled == false are not put in router
-        if service == nil or service.enabled ~= false then
-          local r = {
-            route   = route,
-            service = service,
-          }
+  return true
+end
 
-          i = i + 1
-          routes[i] = r
-        end
-      end
 
-      counter = counter + 1
-    end
+local function update_router()
+  -- we might not need to rebuild the router (if we were not
+  -- the first request in this process to enter this code path)
+  -- check again and rebuild only if necessary
+  local version, err = get_router_version()
+  if err then
+    return nil, "failed to retrieve router version: " .. err
+  end
 
-    local new_router, err = Router.new(routes, router_cache, router_cache_neg)
-    if not new_router then
-      return nil, "could not create router: " .. err
-    end
-
-    router = new_router
-
-    if version then
-      router_version = version
-    end
-
-    router_cache:flush_all()
-    router_cache_neg:flush_all()
-
+  if version == ROUTER_VERSION then
     return true
   end
 
+  local ok, err = build_router(version)
+  if not ok then
+    return nil, --[[ 'err' fully formatted ]] err
+  end
 
-  update_router = function()
-    -- we might not need to rebuild the router (if we were not
-    -- the first request in this process to enter this code path)
-    -- check again and rebuild only if necessary
-    local version, err = get_router_version()
-    if err then
-      return nil, "failed to retrieve router version: " .. err
+  return true
+end
+
+
+local function rebuild_router(opts)
+  return rebuild("router", update_router, ROUTER_VERSION, opts)
+end
+
+
+local function get_updated_router()
+  if kong.db.strategy ~= "off" and kong.configuration.worker_consistency == "strict" then
+    local ok, err = rebuild_router(ROUTER_SYNC_OPTS)
+    if not ok then
+      -- If an error happens while updating, log it and return non-updated
+      -- version.
+      log(ERR, "could not rebuild router: ", err, " (stale router will be used)")
+    end
+  end
+  return ROUTER
+end
+
+
+-- for tests only
+local function _set_update_router(f)
+  update_router = f
+end
+
+local function _set_build_router(f)
+  build_router = f
+end
+
+local function _set_router(r)
+  ROUTER = r
+end
+
+local function _set_router_version(v)
+  ROUTER_VERSION = v
+end
+
+
+local new_plugins_iterator
+do
+  local PluginsIterator_new = PluginsIterator.new
+  new_plugins_iterator = function(version)
+    local plugin_iterator, err = PluginsIterator_new(version)
+    if not plugin_iterator then
+      return nil, err
     end
 
-    if version == router_version then
+    local _, err = kong_shm:incr(PLUGINS_REBUILD_COUNTER_KEY, 1, 0)
+    if err then
+      log(ERR, "failed to increase plugins rebuild counter: ", err)
+    end
+
+    return plugin_iterator
+  end
+end
+
+
+local function build_plugins_iterator(version)
+  local plugins_iterator, err = new_plugins_iterator(version)
+  if not plugins_iterator then
+    return nil, err
+  end
+  PLUGINS_ITERATOR = plugins_iterator
+  return true
+end
+
+
+local function update_plugins_iterator()
+  local version, err = kong.core_cache:get("plugins_iterator:version", TTL_ZERO, utils.uuid)
+  if err then
+    return nil, "failed to retrieve plugins iterator version: " .. err
+  end
+
+  if PLUGINS_ITERATOR and PLUGINS_ITERATOR.version == version then
+    return true
+  end
+
+  local ok, err = build_plugins_iterator(version)
+  if not ok then
+    return nil, --[[ 'err' fully formatted ]] err
+  end
+
+  return true
+end
+
+
+local function rebuild_plugins_iterator(opts)
+  local plugins_iterator_version = PLUGINS_ITERATOR and PLUGINS_ITERATOR.version
+  return rebuild("plugins_iterator", update_plugins_iterator, plugins_iterator_version, opts)
+end
+
+
+local function get_updated_plugins_iterator()
+  if kong.db.strategy ~= "off" and kong.configuration.worker_consistency == "strict" then
+    local ok, err = rebuild_plugins_iterator(PLUGINS_ITERATOR_SYNC_OPTS)
+    if not ok then
+      -- If an error happens while updating, log it and return non-updated
+      -- version
+      log(ERR, "could not rebuild plugins iterator: ", err,
+               " (stale plugins iterator will be used)")
+    end
+  end
+  return PLUGINS_ITERATOR
+end
+
+
+local function get_plugins_iterator()
+  return PLUGINS_ITERATOR
+end
+
+
+-- for tests only
+local function _set_update_plugins_iterator(f)
+  update_plugins_iterator = f
+end
+
+
+local reconfigure_handler
+do
+  local now = ngx.now
+  local update_time = ngx.update_time
+  local ngx_worker_id = ngx.worker.id
+  local exiting = ngx.worker.exiting
+
+  local CLEAR_HEALTH_STATUS_DELAY = constants.CLEAR_HEALTH_STATUS_DELAY
+
+  -- '0' for compare with nil
+  local CURRENT_ROUTER_HASH   = 0
+  local CURRENT_PLUGINS_HASH  = 0
+  local CURRENT_BALANCER_HASH = 0
+
+  local function get_now_ms()
+    update_time()
+    return now() * 1000
+  end
+
+  reconfigure_handler = function(data)
+    local worker_id = ngx_worker_id()
+
+    if exiting() then
+      log(NOTICE, "declarative reconfigure was canceled on worker #", worker_id,
+                  ": process exiting")
       return true
     end
 
-    local ok, err = build_router(version)
-    if not ok then
-      return nil, --[[ 'err' fully formatted ]] err
+    local reconfigure_started_at = get_now_ms()
+
+    log(INFO, "declarative reconfigure was started on worker #", worker_id)
+
+    local default_ws
+    local router_hash
+    local plugins_hash
+    local balancer_hash
+
+    if type(data) == "table" then
+      default_ws    = data[1]
+      router_hash   = data[2]
+      plugins_hash  = data[3]
+      balancer_hash = data[4]
     end
 
-    return true
-  end
+    local ok, err = concurrency.with_coroutine_mutex(RECONFIGURE_OPTS, function()
+      -- below you are encouraged to yield for cooperative threading
 
-
-  rebuild_router = function(opts)
-    return rebuild("router", update_router, router_version, opts)
-  end
-
-
-  get_updated_router = function()
-    if kong.db.strategy ~= "off" and kong.configuration.worker_consistency == "strict" then
-      local ok, err = rebuild_router(ROUTER_SYNC_OPTS)
-      if not ok then
-        -- If an error happens while updating, log it and return non-updated
-        -- version.
-        log(ERR, "could not rebuild router: ", err,
-                 " (stale router will be used)")
+      local rebuild_balancer = balancer_hash ~= CURRENT_BALANCER_HASH
+      if rebuild_balancer then
+        log(DEBUG, "stopping previously started health checkers on worker #", worker_id)
+        balancer.stop_healthcheckers(CLEAR_HEALTH_STATUS_DELAY)
       end
+
+      kong.default_workspace = default_ws
+      ngx.ctx.workspace = default_ws
+
+      local router, err
+      if router_hash ~= CURRENT_ROUTER_HASH then
+        local start = get_now_ms()
+
+        router, err = new_router()
+        if not router then
+          return nil, err
+        end
+
+        log(INFO, "building a new router took ",  get_now_ms() - start,
+                  " ms on worker #", worker_id)
+      end
+
+      local plugins_iterator
+      if plugins_hash ~= CURRENT_PLUGINS_HASH then
+        local start = get_now_ms()
+
+        plugins_iterator, err = new_plugins_iterator()
+        if not plugins_iterator then
+          return nil, err
+        end
+
+        log(INFO, "building a new plugins iterator took ", get_now_ms() - start,
+                  " ms on worker #", worker_id)
+      end
+
+      -- below you are not supposed to yield and this should be fast and atomic
+
+      -- TODO: we should perhaps only purge the configuration related cache.
+
+      log(DEBUG, "flushing caches as part of the reconfiguration on worker #", worker_id)
+
+      kong.core_cache:purge()
+      kong.cache:purge()
+      kong.vault.flush()
+
+      if router then
+        ROUTER = router
+        ROUTER_CACHE:flush_all()
+        ROUTER_CACHE_NEG:flush_all()
+        CURRENT_ROUTER_HASH = router_hash or 0
+      end
+
+      if plugins_iterator then
+        PLUGINS_ITERATOR = plugins_iterator
+        CURRENT_PLUGINS_HASH = plugins_hash or 0
+      end
+
+      if rebuild_balancer then
+        -- TODO: balancer is a big blob of global state and you cannot easily
+        --       initialize new balancer and then atomically flip it.
+        log(DEBUG, "reinitializing balancer with a new configuration on worker #", worker_id)
+        balancer.init()
+        CURRENT_BALANCER_HASH = balancer_hash or 0
+      end
+
+      return true
+    end)  -- concurrency.with_coroutine_mutex
+
+    local reconfigure_time = get_now_ms() - reconfigure_started_at
+
+    if ok then
+      log(INFO, "declarative reconfigure took ", reconfigure_time,
+                " ms on worker #", worker_id)
+
+    else
+      log(ERR, "declarative reconfigure failed after ", reconfigure_time,
+               " ms on worker #", worker_id, ": ", err)
     end
-    return router
-  end
+  end -- reconfigure_handler
+end
 
 
-  -- for tests only
-  _set_update_router = function(f)
-    update_router = f
-  end
-
-
-  -- for tests only
-  _set_build_router = function(f)
-    build_router = f
-  end
-
-
-  -- for tests only
-  _set_router = function(r)
-    router = r
-  end
-
-
-  -- for tests only
-  _set_router_version = function(v)
-    router_version = v
-  end
-
-  -- for tests only
-  _register_balancer_events = function(f)
-    register_balancer_events = f
-  end
+local function register_events()
+  events.register_events(reconfigure_handler)
 end
 
 
@@ -944,9 +757,8 @@ do
     ctx.service          = service
     ctx.route            = route
     ctx.balancer_data    = balancer_data
-    ctx.balancer_address = balancer_data -- for plugin backward compatibility
 
-    if is_http_module and service then
+    if service then
       local res, err
       local client_certificate = service.client_certificate
 
@@ -1023,17 +835,24 @@ end
 
 
 local function set_init_versions_in_cache()
-  if kong.configuration.role ~= "control_pane" then
-    local ok, err = kong.core_cache:safe_set("router:version", "init")
-    if not ok then
-      return nil, "failed to set router version in cache: " .. tostring(err)
-    end
+  -- because of worker events, kong.cache can not be initialized in `init` phase
+  -- therefore, we need to use the shdict API directly to set the initial value
+  assert(kong.configuration.role ~= "control_plane")
+  assert(ngx.get_phase() == "init")
+  local core_cache_shm = ngx.shared["kong_core_db_cache"]
+
+  -- ttl = forever is okay as "*:versions" keys are always manually invalidated
+  local marshalled_value = marshall("init", 0, 0)
+
+  -- see kong.cache.safe_set function
+  local ok, err = core_cache_shm:safe_set("kong_core_db_cacherouter:version", marshalled_value)
+  if not ok then
+    return nil, "failed to set initial router version in cache: " .. tostring(err)
   end
 
-  local ok, err = kong.core_cache:safe_set("plugins_iterator:version", "init")
+  ok, err = core_cache_shm:safe_set("kong_core_db_cacheplugins_iterator:version", marshalled_value)
   if not ok then
-    return nil, "failed to set plugins iterator version in cache: " ..
-                tostring(err)
+    return nil, "failed to set initial plugins iterator version in cache: " .. tostring(err)
   end
 
   return true
@@ -1044,7 +863,7 @@ end
 -- before or after the plugins
 return {
   build_router = build_router,
-
+  update_router = update_router,
   build_plugins_iterator = build_plugins_iterator,
   update_plugins_iterator = update_plugins_iterator,
   get_plugins_iterator = get_plugins_iterator,
@@ -1059,19 +878,74 @@ return {
   _set_update_plugins_iterator = _set_update_plugins_iterator,
   _get_updated_router = get_updated_router,
   _update_lua_mem = update_lua_mem,
-  _register_balancer_events = _register_balancer_events,
 
   init_worker = {
     before = function()
+      -- TODO: PR #9337 may affect the following line
+      local prefix = kong.configuration.prefix or ngx.config.prefix()
+
+      STREAM_TLS_TERMINATE_SOCK = fmt("unix:%s/stream_tls_terminate.sock", prefix)
+      STREAM_TLS_PASSTHROUGH_SOCK = fmt("unix:%s/stream_tls_passthrough.sock", prefix)
+
+      if is_http_module then
+        -- if worker has outdated log level (e.g. newly spawned), updated it
+        timer_at(0, function()
+          local cur_log_level = get_log_level(LOG_LEVELS[kong.configuration.log_level])
+          local shm_log_level = ngx.shared.kong:get(constants.DYN_LOG_LEVEL_KEY)
+          local timeout = (tonumber(ngx.shared.kong:get(constants.DYN_LOG_LEVEL_TIMEOUT_AT_KEY)) or 0) - ngx.time()
+          if shm_log_level and cur_log_level ~= shm_log_level and timeout > 0 then
+            local ok, err = pcall(set_log_level, shm_log_level, timeout)
+            if not ok then
+              local worker = ngx.worker.id()
+              log(ERR, "worker" , worker, " failed setting log level: ", err)
+            end
+          end
+        end)
+
+        -- log level cluster event updates
+        kong.cluster_events:subscribe("log_level", function(data)
+          log(NOTICE, "log level cluster event received")
+
+          if not data then
+            kong.log.err("received empty data in cluster_events subscription")
+            return
+          end
+
+          local ok, err = kong.worker_events.post("debug", "log_level", cjson.decode(data))
+
+          if not ok then
+            kong.log.err("failed broadcasting to workers: ", err)
+            return
+          end
+
+          log(NOTICE, "log level event posted for node")
+        end)
+
+        -- log level worker event updates
+        kong.worker_events.register(function(data)
+          local worker = ngx.worker.id()
+
+          log(NOTICE, "log level worker event received for worker ", worker)
+
+          local ok, err = pcall(set_log_level, data.log_level, data.timeout)
+
+          if not ok then
+            log(ERR, "worker ", worker, " failed setting log level: ", err)
+            return
+          end
+
+          log(NOTICE, "log level changed to ", data.log_level, " for worker ", worker)
+        end, "debug", "log_level")
+      end
+
       if kong.configuration.host_ports then
         HOST_PORTS = kong.configuration.host_ports
       end
 
       if kong.configuration.anonymous_reports then
-        reports.configure_ping(kong.configuration)
+        reports.init(kong.configuration)
         reports.add_ping_value("database_version", kong.db.infos.db_ver)
-        reports.toggle(true)
-        reports.init_worker()
+        reports.init_worker(kong.configuration)
       end
 
       update_lua_mem(true)
@@ -1092,22 +966,17 @@ return {
       do
         local rebuild_timeout = 60
 
-        if strategy == "cassandra" then
-          rebuild_timeout = kong.configuration.cassandra_timeout / 1000
-        end
-
         if strategy == "postgres" then
           rebuild_timeout = kong.configuration.pg_timeout / 1000
         end
 
         if strategy == "off" then
-          FLIP_CONFIG_OPTS = {
-            name = "flip-config",
+          RECONFIGURE_OPTS = {
+            name = "reconfigure",
             timeout = rebuild_timeout,
           }
-        end
 
-        if strategy == "off" or kong.configuration.worker_consistency == "strict" then
+        elseif kong.configuration.worker_consistency == "strict" then
           ROUTER_SYNC_OPTS = {
             name = "router",
             timeout = rebuild_timeout,
@@ -1144,14 +1013,11 @@ return {
           if not ok then
             log(ERR, "could not rebuild router via timer: ", err)
           end
-
-          local _, err = timer_at(worker_state_update_frequency, rebuild_router_timer)
-          if err then
-            log(ERR, "could not schedule timer to rebuild router: ", err)
-          end
         end
 
-        local _, err = timer_at(worker_state_update_frequency, rebuild_router_timer)
+        local _, err = kong.timer:named_every("router-rebuild",
+                                         worker_state_update_frequency,
+                                         rebuild_router_timer)
         if err then
           log(ERR, "could not schedule timer to rebuild router: ", err)
         end
@@ -1171,27 +1037,17 @@ return {
           if err then
             log(ERR, "could not rebuild plugins iterator via timer: ", err)
           end
-
-          local _, err = timer_at(worker_state_update_frequency, rebuild_plugins_iterator_timer)
-          if err then
-            log(ERR, "could not schedule timer to rebuild plugins iterator: ", err)
-          end
         end
 
-        local _, err = timer_at(worker_state_update_frequency, rebuild_plugins_iterator_timer)
+        local _, err = kong.timer:named_every("plugins-iterator-rebuild",
+                                         worker_state_update_frequency,
+                                         rebuild_plugins_iterator_timer)
         if err then
           log(ERR, "could not schedule timer to rebuild plugins iterator: ", err)
         end
 
       end
     end,
-    after = NOOP,
-  },
-  certificate = {
-    before = function(ctx) -- Note: ctx here is for a connection (not for a single request)
-      certificate.execute()
-    end,
-    after = NOOP,
   },
   preread = {
     before = function(ctx)
@@ -1200,7 +1056,7 @@ return {
 
       local router = get_updated_router()
 
-      local match_t = router.exec(ctx)
+      local match_t = router:exec(ctx)
       if not match_t then
         log(ERR, "no Route found with those values")
         return exit(500)
@@ -1214,10 +1070,10 @@ return {
         local protocols = route.protocols
         if protocols and protocols.tls then
           log(DEBUG, "TLS termination required, return to second layer proxying")
-          var.kong_tls_preread_block_upstream = stream_tls_terminate_sock
+          var.kong_tls_preread_block_upstream = STREAM_TLS_TERMINATE_SOCK
 
         elseif protocols and protocols.tls_passthrough then
-          var.kong_tls_preread_block_upstream = stream_tls_passthrough_sock
+          var.kong_tls_preread_block_upstream = STREAM_TLS_PASSTHROUGH_SOCK
 
         else
           log(ERR, "unexpected protocols in matched Route")
@@ -1238,12 +1094,12 @@ return {
                        upstream_url_t.host,
                        upstream_url_t.port,
                        service, route)
+      var.upstream_host = upstream_url_t.host
     end,
     after = function(ctx)
       local ok, err, errcode = balancer_execute(ctx)
       if not ok then
-        local body = utils.get_default_exit_body(errcode, err)
-        return kong.response.exit(errcode, body)
+        return kong.response.error(errcode, err)
       end
     end
   },
@@ -1253,7 +1109,6 @@ return {
       ctx.host_port = HOST_PORTS[server_port] or server_port
       instrumentation.request(ctx)
     end,
-    after = NOOP,
   },
   access = {
     before = function(ctx)
@@ -1273,7 +1128,7 @@ return {
 
       -- routing request
       local router = get_updated_router()
-      local match_t = router.exec(ctx)
+      local match_t = router:exec(ctx)
       if not match_t then
         -- tracing
         if span then
@@ -1281,7 +1136,7 @@ return {
           span:finish()
         end
 
-        return kong.response.exit(404, { message = "no Route matched with those values" })
+        return kong.response.error(404, "no Route matched with those values")
       end
 
       -- ends tracing span
@@ -1348,7 +1203,7 @@ return {
         local redirect_status_code = route.https_redirect_status_code or 426
 
         if redirect_status_code == 426 then
-          return kong.response.exit(426, { message = "Please use HTTPS protocol" }, {
+          return kong.response.error(426, "Please use HTTPS protocol", {
             ["Connection"] = "Upgrade",
             ["Upgrade"]    = "TLS/1.2, HTTP/1.1",
           })
@@ -1372,7 +1227,7 @@ return {
         if content_type and sub(content_type, 1, #"application/grpc") == "application/grpc" then
           if protocol_version ~= 2 then
             -- mismatch: non-http/2 request matched grpc route
-            return kong.response.exit(426, { message = "Please use HTTP2 protocol" }, {
+            return kong.response.error(426, "Please use HTTP2 protocol", {
               ["connection"] = "Upgrade",
               ["upgrade"]    = "HTTP/2",
             })
@@ -1380,7 +1235,7 @@ return {
 
         else
           -- mismatch: non-grpc request matched grpc route
-          return kong.response.exit(415, { message = "Non-gRPC request matched gRPC route" })
+          return kong.response.error(415, "Non-gRPC request matched gRPC route")
         end
 
         if not protocols.grpc and forwarded_proto ~= "https" then
@@ -1444,18 +1299,16 @@ return {
           return exec("@grpc")
         end
 
-        if protocol_version == 1.1 then
-          if route.request_buffering == false then
-            if route.response_buffering == false then
-              return exec("@unbuffered")
-            end
-
-            return exec("@unbuffered_request")
-          end
-
+        if route.request_buffering == false then
           if route.response_buffering == false then
-            return exec("@unbuffered_response")
+            return exec("@unbuffered")
           end
+
+          return exec("@unbuffered_request")
+        end
+
+        if route.response_buffering == false then
+          return exec("@unbuffered_response")
         end
       end
     end,
@@ -1470,7 +1323,7 @@ return {
       if byte(ctx.request_uri or var.request_uri, -1) == QUESTION_MARK then
         var.upstream_uri = var.upstream_uri .. "?"
       elseif var.is_args == "?" then
-        var.upstream_uri = var.upstream_uri .. "?" .. var.args or ""
+        var.upstream_uri = var.upstream_uri .. "?" .. (var.args or "")
       end
 
       local upstream_scheme = var.upstream_scheme
@@ -1502,8 +1355,7 @@ return {
 
       local ok, err, errcode = balancer_execute(ctx)
       if not ok then
-        local body = utils.get_default_exit_body(errcode, err)
-        return kong.response.exit(errcode, body)
+        return kong.response.error(errcode, err)
       end
 
       local ok, err = balancer.set_host_header(balancer_data, upstream_scheme, upstream_host)
@@ -1558,10 +1410,6 @@ return {
       end
     end
   },
-  response = {
-    before = NOOP,
-    after = NOOP,
-  },
   header_filter = {
     before = function(ctx)
       if not ctx.KONG_PROXIED then
@@ -1593,7 +1441,8 @@ return {
 
       local upstream_status_header = constants.HEADERS.UPSTREAM_STATUS
       if kong.configuration.enabled_headers[upstream_status_header] then
-        header[upstream_status_header] = tonumber(sub(var.upstream_status or "", -3))
+        local upstream_status = ctx.buffered_status or tonumber(sub(var.upstream_status or "", -3))
+        header[upstream_status_header] = upstream_status
         if not header[upstream_status_header] then
           log(ERR, "failed to set ", upstream_status_header, " header")
         end
@@ -1611,6 +1460,8 @@ return {
           current_try.code = status
         end
       end
+
+      instrumentation.runloop_before_header_filter(status)
 
       local hash_cookie = ctx.balancer_data.hash_cookie
       if hash_cookie then
@@ -1630,7 +1481,7 @@ return {
         end
 
         if enabled_headers[headers.VIA] then
-          header[headers.VIA] = server_header
+          header[headers.VIA] = SERVER_HEADER
         end
 
       else
@@ -1641,9 +1492,9 @@ return {
         -- Some plugins short-circuit the request with Via-header, and in those cases
         -- we don't want to set the Server-header, if the Via-header matches with
         -- the Kong server header.
-        if not (enabled_headers[headers.VIA] and header[headers.VIA] == server_header) then
+        if not (enabled_headers[headers.VIA] and header[headers.VIA] == SERVER_HEADER) then
           if enabled_headers[headers.SERVER] then
-            header[headers.SERVER] = server_header
+            header[headers.SERVER] = SERVER_HEADER
 
           else
             header[headers.SERVER] = nil
@@ -1673,7 +1524,10 @@ return {
       -- Report HTTP status for health checks
       local balancer_data = ctx.balancer_data
       if balancer_data and balancer_data.balancer_handle then
-        local status = ngx.status
+        -- https://nginx.org/en/docs/http/ngx_http_upstream_module.html#variables
+        -- because of the way of Nginx do the upstream_status variable, it may be
+        -- a string or a number, so we need to parse it to get the status
+        local status = tonumber(ctx.buffered_status) or tonumber(sub(var.upstream_status or "", -3)) or ngx.status
         if status == 504 then
           balancer_data.balancer.report_timeout(balancer_data.balancer_handle)
         else
@@ -1685,6 +1539,7 @@ return {
           balancer_data.balancer_handle:release()
         end
       end
+      balancer.after_balance(balancer_data, ctx)
     end
   }
 }

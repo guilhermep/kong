@@ -1188,16 +1188,10 @@ for _, strategy in helpers.each_strategy() do
             local body = assert.res_status(200, res)
             local json = cjson.decode(body)
 
-            if strategy == "cassandra" then
-              assert.equals(ngx.null, json.paths)
-              assert.equals(ngx.null, json.methods)
-
-            else
-              assert.matches('"methods":%[%]', body)
-              assert.matches('"paths":%[%]', body)
-              assert.same({}, json.paths)
-              assert.same({}, json.methods)
-            end
+            assert.matches('"methods":%[%]', body)
+            assert.matches('"paths":%[%]', body)
+            assert.same({}, json.paths)
+            assert.same({}, json.methods)
 
             assert.same({ "my-updated.tld" }, json.hosts)
             assert.equal(route.id, json.id)
@@ -1543,12 +1537,12 @@ for _, strategy in helpers.each_strategy() do
                 ["Content-Type"] = content_type
               },
               body = {
-                url = "http://httpbin.org",
+                url = "http://konghq.com",
               },
             })
             local body = assert.res_status(200, res)
             local json = cjson.decode(body)
-            assert.same("httpbin.org", json.host)
+            assert.same("konghq.com", json.host)
 
             local in_db = assert(db.services:select({ id = json.id }, { nulls = true }))
             assert.same(json, in_db)
@@ -1795,8 +1789,7 @@ for _, strategy in helpers.each_strategy() do
               end
             end)
 
-            -- Cassandra doesn't fail on this because its insert is an upsert
-            pending("returns 409 on id conflict (same plugin id)", function(content_type)
+            it("returns 409 on id conflict (same plugin id)", function(content_type)
               return function()
                 local route = bp.routes:insert({ paths = { "/my-route" } })
                 -- insert initial plugin
@@ -1881,6 +1874,70 @@ for _, strategy in helpers.each_strategy() do
               }
             })
             assert.res_status(200, res)
+          end)
+        end)
+      end)
+
+      describe("/routes/{route}/plugins/{plugin}", function()
+        describe("GET", function()
+          it("retrieves a plugin by id", function()
+            local service = bp.services:insert()
+            local route = bp.routes:insert({
+              service = { id = service.id },
+              hosts = { "example.test" },
+            })
+            local plugin = bp.key_auth_plugins:insert({
+              route = route,
+            })
+            local res = client:get("/routes/" .. route.id .. "/plugins/" .. plugin.id)
+            local body = assert.res_status(200, res)
+            local json = cjson.decode(body)
+            local in_db = assert(db.plugins:select({ id = plugin.id }, { nulls = true }))
+            assert.same(json, in_db)
+          end)
+          it("retrieves a plugin by instance_name", function()
+            local service = bp.services:insert()
+            local route = bp.routes:insert({
+              service = { id = service.id },
+              hosts = { "example.test" },
+            })
+            local plugin = bp.key_auth_plugins:insert({
+              instance_name = "name-" .. utils.uuid(),
+              route = route,
+            })
+            local res = client:get("/routes/" .. route.id .. "/plugins/" .. plugin.instance_name)
+            local body = assert.res_status(200, res)
+            local json = cjson.decode(body)
+            local in_db = assert(db.plugins:select({ id = plugin.id }, { nulls = true }))
+            assert.same(json, in_db)
+          end)
+        end)
+
+        describe("DELETE", function()
+          it("deletes a plugin by id", function()
+            local route = bp.routes:insert({ paths = { "/route-" .. utils.uuid() }})
+            local plugin = bp.key_auth_plugins:insert({
+              route = route,
+            })
+            local res = assert(client:delete("/routes/" .. route.id .. "/plugins/" .. plugin.id))
+            assert.res_status(204, res)
+
+            local in_db, err = db.plugins:select({id = plugin.id}, { nulls = true })
+            assert.is_nil(err)
+            assert.is_nil(in_db)
+          end)
+          it("deletes a plugin by instance_name", function()
+            local route = bp.routes:insert({ paths = { "/route-" .. utils.uuid() }})
+            local plugin = bp.key_auth_plugins:insert({
+              instance_name = "name-" .. utils.uuid(),
+              route = route,
+            })
+            local res = assert(client:delete("/routes/" .. route.id .. "/plugins/" .. plugin.instance_name))
+            assert.res_status(204, res)
+
+            local in_db, err = db.plugins:select({id = plugin.id}, { nulls = true })
+            assert.is_nil(err)
+            assert.is_nil(in_db)
           end)
         end)
       end)

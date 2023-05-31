@@ -11,7 +11,7 @@ function red() {
 export BUSTED_ARGS="--no-k -o htest -v --exclude-tags=flaky,ipv6"
 
 if [ "$KONG_TEST_DATABASE" == "postgres" ]; then
-    export TEST_CMD="bin/busted $BUSTED_ARGS,cassandra,off"
+    export TEST_CMD="bin/busted $BUSTED_ARGS,off"
 
     psql -v ON_ERROR_STOP=1 -h localhost --username "$KONG_TEST_PG_USER" <<-EOSQL
         CREATE user ${KONG_TEST_PG_USER}_ro;
@@ -22,25 +22,24 @@ if [ "$KONG_TEST_DATABASE" == "postgres" ]; then
 EOSQL
 
 elif [ "$KONG_TEST_DATABASE" == "cassandra" ]; then
-    export KONG_TEST_CASSANDRA_KEYSPACE=kong_tests
-    export KONG_TEST_DB_UPDATE_PROPAGATION=1
-    export TEST_CMD="bin/busted $BUSTED_ARGS,postgres,off"
+  echo "Cassandra is no longer supported"
+  exit 1
 
 else
-    export TEST_CMD="bin/busted $BUSTED_ARGS,postgres,cassandra,db"
+    export TEST_CMD="bin/busted $BUSTED_ARGS,postgres,db"
 fi
 
 if [ "$TEST_SUITE" == "integration" ]; then
     if [[ "$TEST_SPLIT" == first* ]]; then
         # GitHub Actions, run first batch of integration tests
-        eval "$TEST_CMD" $(ls -d spec/02-integration/* | head -n4)
+        eval "$TEST_CMD" $(ls -d spec/02-integration/* | sort | grep -v 05-proxy)
 
     elif [[ "$TEST_SPLIT" == second* ]]; then
         # GitHub Actions, run second batch of integration tests
         # Note that the split here is chosen carefully to result
         # in a similar run time between the two batches, and should
         # be adjusted if imbalance become significant in the future
-        eval "$TEST_CMD" $(ls -d spec/02-integration/* | tail -n+5)
+        eval "$TEST_CMD" $(ls -d spec/02-integration/* | sort | grep 05-proxy)
 
     else
         # Non GitHub Actions
@@ -52,7 +51,10 @@ if [ "$TEST_SUITE" == "dbless" ]; then
     eval "$TEST_CMD" spec/02-integration/02-cmd \
                      spec/02-integration/05-proxy \
                      spec/02-integration/04-admin_api/02-kong_routes_spec.lua \
-                     spec/02-integration/04-admin_api/15-off_spec.lua
+                     spec/02-integration/04-admin_api/15-off_spec.lua \
+                     spec/02-integration/08-status_api/01-core_routes_spec.lua \
+                     spec/02-integration/08-status_api/03-readiness_endpoint_spec.lua \
+                     spec/02-integration/11-dbless
 fi
 if [ "$TEST_SUITE" == "plugins" ]; then
     set +ex
@@ -123,7 +125,7 @@ if [ "$TEST_SUITE" == "plugins" ]; then
     fi
 fi
 if [ "$TEST_SUITE" == "pdk" ]; then
-    TEST_NGINX_RANDOMIZE=1 prove -I. -r t/01-pdk
+    prove -I. -r t/01-pdk
 fi
 if [ "$TEST_SUITE" == "unit" ]; then
     unset KONG_TEST_NGINX_USER KONG_PG_PASSWORD KONG_TEST_PG_PASSWORD

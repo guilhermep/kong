@@ -1,4 +1,5 @@
 local strategies = require "kong.plugins.proxy-cache.strategies"
+local typedefs = require "kong.db.schema.typedefs"
 
 
 local ngx = ngx
@@ -16,6 +17,7 @@ end
 return {
   name = "proxy-cache",
   fields = {
+    { protocols = typedefs.protocols },
     { config = {
         type = "record",
         fields = {
@@ -55,6 +57,11 @@ return {
             type = "boolean",
             default = false,
             required = true,
+          }},
+          { ignore_uri_case = {
+            type = "boolean",
+            default = false,
+            required = false,
           }},
           { storage_ttl = {
             type = "integer",

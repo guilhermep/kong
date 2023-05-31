@@ -20,7 +20,7 @@ local healthcheckers_M = {}
 local healthcheck_subscribers = {}
 
 function healthcheckers_M.init()
-  healthcheck = require("kong.resty.healthcheck") -- delayed initialization
+  healthcheck = require("resty.healthcheck") -- delayed initialization
 end
 
 
@@ -270,12 +270,14 @@ function healthcheckers_M.create_healthchecker(balancer, upstream)
     ssl_cert, ssl_key = parse_global_cert_and_key()
   end
 
+  local events_module = "resty.events"
   local healthchecker, err = healthcheck.new({
     name = assert(upstream.ws_id) .. ":" .. upstream.name,
     shm_name = "kong_healthchecks",
     checks = checks,
     ssl_cert = ssl_cert,
     ssl_key = ssl_key,
+    events_module = events_module,
   })
 
   if not healthchecker then
@@ -326,7 +328,7 @@ function healthcheckers_M.get_upstream_health(upstream_id)
     local key = target.name .. ":" .. target.port
     health_info[key] = balancer:getTargetStatus(target)
     for _, address in ipairs(health_info[key].addresses) do
-      if using_hc then
+      if using_hc and target.weight > 0 then
         address.health = address.healthy and "HEALTHY" or "UNHEALTHY"
       else
         address.health = "HEALTHCHECKS_OFF"
@@ -355,7 +357,10 @@ function healthcheckers_M.get_balancer_health(upstream_id)
   end
 
   local healthchecker
-  local balancer_status
+
+  local balancer_status = balancer:getStatus()
+  local balancer_health = balancer_status.healthy and "HEALTHY" or "UNHEALTHY"
+
   local health = "HEALTHCHECKS_OFF"
   if is_upstream_using_healthcheck(upstream) then
     healthchecker = balancer.healthchecker
@@ -363,12 +368,12 @@ function healthcheckers_M.get_balancer_health(upstream_id)
       return nil, "healthchecker not found"
     end
 
-    balancer_status = balancer:getStatus()
-    health = balancer_status.healthy and "HEALTHY" or "UNHEALTHY"
+    health = balancer_health
   end
 
   return {
     health = health,
+    balancer_health = balancer_health,
     id = upstream_id,
     details = balancer_status,
   }

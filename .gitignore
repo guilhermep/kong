@@ -4,8 +4,11 @@
 .project
 .idea
 .env
+.vscode
+.VSCodeCounter
 
 servroot*
+mockserver
 
 # kong
 nginx_tmp/
@@ -26,3 +29,9 @@ bin/grpcurl
 
 *.so
 *.bak
+*.rock
+
+bazel-*
+
+worktree/
+bin/bazel

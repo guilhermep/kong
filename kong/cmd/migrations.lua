@@ -24,7 +24,9 @@ The available commands are:
 
   list                              List executed migrations.
 
-  reset                             Reset the database.
+  reset                             Reset the database. The `reset` command erases all of the data in Kong's database and deletes all of the schemas.
+
+  status                            Dump the database migration status in JSON format
 
 Options:
  -y,--yes                           Assume "yes" to prompts and run
@@ -36,8 +38,8 @@ Options:
                                     as already executed.
 
  --db-timeout     (default 60)      Timeout, in seconds, for all database
-                                    operations (including schema consensus for
-                                    Cassandra).
+                                    operations.
+
 
  --lock-timeout   (default 60)      Timeout, in seconds, for nodes waiting on
                                     the leader node to finish running
@@ -64,7 +66,7 @@ local function confirm_prompt(q)
   }
 
   while MAX > 0 do
-    io.write("> " .. q .. " [Y/n] ")
+    io.write("> " .. q .. " [y/n] ")
     local a = io.read("*l")
     if ANSWERS[a] ~= nil then
       return ANSWERS[a]
@@ -89,9 +91,6 @@ local function execute(args)
   package.path = conf.lua_package_path .. ";" .. package.path
 
   conf.pg_timeout = args.db_timeout -- connect + send + read
-
-  conf.cassandra_timeout = args.db_timeout -- connect + send + read
-  conf.cassandra_schema_consensus_timeout = args.db_timeout
 
   assert(prefix_handler.prepare_prefix(conf, args.nginx_conf, true))
 
@@ -154,6 +153,27 @@ local function execute(args)
 
     -- exit(0)
 
+  elseif args.command == "status" then
+
+    -- Clean up the schema_state data structure so that it can be
+    -- serialized as json.
+    local function cleanup (namespace_migrations)
+      if namespace_migrations then
+        for _, namespace_migration in pairs(namespace_migrations) do
+          for i = 1, #namespace_migration.migrations do
+            namespace_migration.migrations[i] = namespace_migration.migrations[i].name
+          end
+        end
+      end
+    end
+
+    cleanup(schema_state.new_migrations)
+    cleanup(schema_state.pending_migrations)
+    cleanup(schema_state.executed_migrations)
+
+    local cjson = require "cjson"
+    print(cjson.encode(schema_state))
+
   elseif args.command == "bootstrap" then
     if args.force then
       migrations_utils.reset(schema_state, db, args.lock_timeout)
@@ -208,5 +228,6 @@ return {
     finish = true,
     list = true,
     reset = true,
+    status = true
   }
 }

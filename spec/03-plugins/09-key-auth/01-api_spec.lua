@@ -137,7 +137,7 @@ for _, strategy in helpers.each_strategy() do
 
           ngx.sleep(3)
 
-          local id = json.consumer.id
+          local id = json.id
           local res = assert(admin_client:send {
             method  = "GET",
             path    = "/consumers/bob/key-auth/" .. id,
@@ -469,10 +469,7 @@ for _, strategy in helpers.each_strategy() do
           assert.equal(3, #json_2.data)
 
           assert.not_same(json_1.data, json_2.data)
-          -- Disabled: on Cassandra, the last page still returns a
-          -- next_page token, and thus, an offset proprty in the
-          -- response of the Admin API.
-          --assert.is_nil(json_2.offset) -- last page
+          assert.is_nil(json_2.offset) -- last page
         end)
       end)
 

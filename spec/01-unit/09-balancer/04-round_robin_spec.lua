@@ -248,6 +248,7 @@ describe("[round robin balancer]", function()
     targets = require "kong.runloop.balancer.targets"
     balancers = require "kong.runloop.balancer.balancers"
     local healthcheckers = require "kong.runloop.balancer.healthcheckers"
+
     healthcheckers.init()
     balancers.init()
 
@@ -255,14 +256,10 @@ describe("[round robin balancer]", function()
 
     _G.kong = kong
 
-    kong.worker_events = require "resty.worker.events"
+    kong.worker_events = require "resty.events.compat"
     kong.worker_events.configure({
-      shm = "kong_process_events", -- defined by "lua_shared_dict"
-      timeout = 5,            -- life time of event data in shm
-      interval = 1,           -- poll interval (seconds)
-
-      wait_interval = 0.010,  -- wait before retry fetching event data
-      wait_max = 0.5,         -- max wait time before discarding event
+      listening = "unix:",
+      testing = true,
     })
 
     local function empty_each()
@@ -303,9 +300,10 @@ describe("[round robin balancer]", function()
     setup_block()
     assert(client.init {
       hosts = {},
-      resolvConf = {
-        "nameserver 8.8.8.8"
-      },
+      -- don't supply resolvConf and fallback to default resolver
+      -- so that CI and docker can have reliable results
+      -- but remove `search` and `domain`
+      search = {},
     })
     snapshot = assert:snapshot()
   end)
@@ -402,7 +400,7 @@ describe("[round robin balancer]", function()
         })
         add_target(b, "mashape.test", 80, 10)
         check_balancer(b)
-        assert.equals(10, b.totalWeight) -- has one succesful host, so weight must equal that one
+        assert.equals(10, b.totalWeight) -- has one successful host, so weight must equal that one
       end)
       it("accepts a hostname when dns server is unavailable #slow", function()
         -- This test might show some error output similar to the lines below. This is expected and ok.
@@ -522,35 +520,7 @@ describe("[round robin balancer]", function()
         assert.matches("Balancer is unhealthy", port)
 
       end)
-      it("SRV target with A record targets can be changed with an address", function()
-        local b = check_balancer(new_balancer { dns = client })
-        dnsA({
-          { name = "mashape1.test", address = "12.34.56.1" },
-        })
-        dnsA({
-          { name = "mashape2.test", address = "12.34.56.2" },
-        })
-        dnsSRV({
-          { name = "mashape.test", target = "mashape1.test", port = 8001, weight = 5 },
-          { name = "mashape.test", target = "mashape2.test", port = 8002, weight = 5 },
-        })
-        add_target(b, "mashape.test", 80, 10)
 
-        local _, _, _, handle = b:getPeer()
-        local ok, err = b:setAddressStatus(handle.address, false)
-        assert.is_true(ok)
-        assert.is_nil(err)
-
-        _, _, _, handle = b:getPeer()
-        ok, err = b:setAddressStatus(handle.address, false)
-        assert.is_true(ok)
-        assert.is_nil(err)
-
-        local ip, port = b:getPeer()
-        assert.is_nil(ip)
-        assert.matches("Balancer is unhealthy", port)
-
-      end)
       it("SRV target with port=0 returns the default port", function()
         local b = check_balancer(new_balancer { dns = client })
         dnsA({
@@ -1291,9 +1261,10 @@ describe("[round robin balancer]", function()
       -- reconfigure the dns client to make sure next query works again
       assert(client.init {
         hosts = {},
-        resolvConf = {
-          "nameserver 8.8.8.8"
-        },
+        -- don't supply resolvConf and fallback to default resolver
+        -- so that CI and docker can have reliable results
+        -- but remove `search` and `domain`
+        search = {},
       })
       dnsA({
         { name = "mashape.test", address = "1.2.3.4" },

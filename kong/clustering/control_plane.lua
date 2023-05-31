@@ -7,22 +7,26 @@ local cjson = require("cjson.safe")
 local declarative = require("kong.db.declarative")
 local utils = require("kong.tools.utils")
 local clustering_utils = require("kong.clustering.utils")
+local compat = require("kong.clustering.compat")
 local constants = require("kong.constants")
+local events = require("kong.clustering.events")
+local calculate_config_hash = require("kong.clustering.config_helper").calculate_config_hash
+
+
 local string = string
 local setmetatable = setmetatable
 local type = type
 local pcall = pcall
 local pairs = pairs
-local yield = utils.yield
-local ipairs = ipairs
-local tonumber = tonumber
 local ngx = ngx
 local ngx_log = ngx.log
+local timer_at = ngx.timer.at
 local cjson_decode = cjson.decode
 local cjson_encode = cjson.encode
 local kong = kong
 local ngx_exit = ngx.exit
 local exiting = ngx.worker.exiting
+local worker_id = ngx.worker.id
 local ngx_time = ngx.time
 local ngx_now = ngx.now
 local ngx_update_time = ngx.update_time
@@ -30,10 +34,16 @@ local ngx_var = ngx.var
 local table_insert = table.insert
 local table_remove = table.remove
 local sub = string.sub
-local gsub = string.gsub
-local deflate_gzip = utils.deflate_gzip
+local isempty = require("table.isempty")
+local sleep = ngx.sleep
 
-local calculate_config_hash = require("kong.clustering.config_helper").calculate_config_hash
+
+local plugins_list_to_map = compat.plugins_list_to_map
+local update_compatible_payload = compat.update_compatible_payload
+local deflate_gzip = utils.deflate_gzip
+local yield = utils.yield
+local connect_dp = clustering_utils.connect_dp
+
 
 local kong_dict = ngx.shared.kong
 local ngx_DEBUG = ngx.DEBUG
@@ -49,14 +59,12 @@ local CLUSTERING_SYNC_STATUS = constants.CLUSTERING_SYNC_STATUS
 local DECLARATIVE_EMPTY_CONFIG_HASH = constants.DECLARATIVE_EMPTY_CONFIG_HASH
 local PONG_TYPE = "PONG"
 local RECONFIGURE_TYPE = "RECONFIGURE"
-local REMOVED_FIELDS = require("kong.clustering.compat.removed_fields")
 local _log_prefix = "[clustering] "
 
 
-local plugins_list_to_map = clustering_utils.plugins_list_to_map
-
-
 local function handle_export_deflated_reconfigure_payload(self)
+  ngx_log(ngx_DEBUG, _log_prefix, "exporting config")
+
   local ok, p_err, err = pcall(self.export_deflated_reconfigure_payload, self)
   return ok, p_err or err
 end
@@ -67,116 +75,22 @@ local function is_timeout(err)
 end
 
 
-function _M.new(conf, cert_digest)
+function _M.new(clustering)
+  assert(type(clustering) == "table",
+         "kong.clustering is not instantiated")
+
+  assert(type(clustering.conf) == "table",
+         "kong.clustering did not provide configuration")
+
   local self = {
     clients = setmetatable({}, { __mode = "k", }),
     plugins_map = {},
-
-    conf = conf,
-    cert_digest = cert_digest,
+    conf = clustering.conf,
   }
 
   return setmetatable(self, _MT)
 end
 
-
-local function invalidate_keys_from_config(config_plugins, keys)
-  if not config_plugins then
-    return false
-  end
-
-  local has_update
-
-  for _, t in ipairs(config_plugins) do
-    local config = t and t["config"]
-    if config then
-      local name = gsub(t["name"], "-", "_")
-
-      -- Handle Redis configurations (regardless of plugin)
-      if config.redis then
-        local config_plugin_redis = config.redis
-        for _, key in ipairs(keys["redis"]) do
-          if config_plugin_redis[key] ~= nil then
-            config_plugin_redis[key] = nil
-            has_update = true
-          end
-        end
-      end
-
-      -- Handle fields in specific plugins
-      if keys[name] ~= nil then
-        for _, key in ipairs(keys[name]) do
-          if config[key] ~= nil then
-            config[key] = nil
-            has_update = true
-          end
-        end
-      end
-    end
-  end
-
-  return has_update
-end
-
-local function dp_version_num(dp_version)
-  local base = 1000000000
-  local version_num = 0
-  for _, v in ipairs(utils.split(dp_version, ".", 4)) do
-    v = v:match("^(%d+)")
-    version_num = version_num + base * tonumber(v, 10) or 0
-    base = base / 1000
-  end
-
-  return version_num
-end
--- for test
-_M._dp_version_num = dp_version_num
-
-local function get_removed_fields(dp_version_number)
-  local unknown_fields = {}
-  local has_fields
-
-  -- Merge dataplane unknown fields; if needed based on DP version
-  for v, list in pairs(REMOVED_FIELDS) do
-    if dp_version_number < v then
-      has_fields = true
-      for plugin, fields in pairs(list) do
-        if not unknown_fields[plugin] then
-          unknown_fields[plugin] = {}
-        end
-        for _, k in ipairs(fields) do
-          table_insert(unknown_fields[plugin], k)
-        end
-      end
-    end
-  end
-
-  return has_fields and unknown_fields or nil
-end
--- for test
-_M._get_removed_fields = get_removed_fields
-
--- returns has_update, modified_deflated_payload, err
-local function update_compatible_payload(payload, dp_version)
-  local fields = get_removed_fields(dp_version_num(dp_version))
-  if fields then
-    payload = utils.deep_copy(payload, false)
-    local config_table = payload["config_table"]
-    local has_update = invalidate_keys_from_config(config_table["plugins"], fields)
-    if has_update then
-      local deflated_payload, err = deflate_gzip(cjson_encode(payload))
-      if deflated_payload then
-        return true, deflated_payload
-      else
-        return true, nil, err
-      end
-    end
-  end
-
-  return false, nil, nil
-end
--- for test
-_M._update_compatible_payload = update_compatible_payload
 
 function _M:export_deflated_reconfigure_payload()
   local config_table, err = declarative.export_config()
@@ -193,7 +107,7 @@ function _M:export_deflated_reconfigure_payload()
   end
 
   -- store serialized plugins map for troubleshooting purposes
-  local shm_key_name = "clustering:cp_plugins_configured:worker_" .. ngx.worker.id()
+  local shm_key_name = "clustering:cp_plugins_configured:worker_" .. worker_id()
   kong_dict:set(shm_key_name, cjson_encode(self.plugins_configured))
   ngx_log(ngx_DEBUG, "plugin configuration map key: " .. shm_key_name .. " configuration: ", kong_dict:get(shm_key_name))
 
@@ -253,8 +167,8 @@ function _M:push_config()
 end
 
 
-_M.check_version_compatibility = clustering_utils.check_version_compatibility
-_M.check_configuration_compatibility = clustering_utils.check_configuration_compatibility
+_M.check_version_compatibility = compat.check_version_compatibility
+_M.check_configuration_compatibility = compat.check_configuration_compatibility
 
 
 function _M:handle_cp_websocket()
@@ -263,9 +177,7 @@ function _M:handle_cp_websocket()
   local dp_ip = ngx_var.remote_addr
   local dp_version = ngx_var.arg_node_version
 
-  local wb, log_suffix, ec = clustering_utils.connect_dp(
-                                self.conf, self.cert_digest,
-                                dp_id, dp_hostname, dp_ip, dp_version)
+  local wb, log_suffix, ec = connect_dp(dp_id, dp_hostname, dp_ip, dp_version)
   if not wb then
     return ngx_exit(ec)
   end
@@ -330,7 +242,11 @@ function _M:handle_cp_websocket()
   end
 
   local _
-  _, err, sync_status = self:check_version_compatibility(dp_version, dp_plugins_map, log_suffix)
+  _, err, sync_status = self:check_version_compatibility({
+    dp_version = dp_version,
+    dp_plugins_map = dp_plugins_map,
+    log_suffix = log_suffix,
+  })
   if err then
     ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
     wb:send_close()
@@ -353,16 +269,20 @@ function _M:handle_cp_websocket()
     }
   end
 
-  self.clients[wb] = queue
-
-  if not self.deflated_reconfigure_payload then
+  -- if clients table is empty, we might have skipped some config
+  -- push event in `push_config_loop`, which means the cached config
+  -- might be stale, so we always export the latest config again in this case
+  if isempty(self.clients) or not self.deflated_reconfigure_payload then
     _, err = handle_export_deflated_reconfigure_payload(self)
   end
+
+  self.clients[wb] = queue
 
   if self.deflated_reconfigure_payload then
     local _
     -- initial configuration compatibility for sync status variable
-    _, _, sync_status = self:check_configuration_compatibility(dp_plugins_map)
+    _, _, sync_status = self:check_configuration_compatibility(
+                              { dp_plugins_map = dp_plugins_map, })
 
     table_insert(queue, RECONFIGURE_TYPE)
     queue.post()
@@ -459,9 +379,10 @@ function _M:handle_cp_websocket()
 
         else -- is reconfigure
           local previous_sync_status = sync_status
-          ok, err, sync_status = self:check_configuration_compatibility(dp_plugins_map)
+          ok, err, sync_status = self:check_configuration_compatibility(
+                                    { dp_plugins_map = dp_plugins_map, })
           if ok then
-            local has_update, deflated_payload, err = update_compatible_payload(self.reconfigure_payload, dp_version)
+            local has_update, deflated_payload, err = update_compatible_payload(self.reconfigure_payload, dp_version, log_suffix)
             if not has_update then -- no modification, use the cached payload
               deflated_payload = self.deflated_reconfigure_payload
             elseif err then
@@ -539,27 +460,38 @@ local function push_config_loop(premature, self, push_config_semaphore, delay)
     if exiting() then
       return
     end
+
     if ok then
-      ok, err = pcall(self.push_config, self)
-      if ok then
-        local sleep_left = delay
-        while sleep_left > 0 do
-          if sleep_left <= 1 then
-            ngx.sleep(sleep_left)
-            break
-          end
-
-          ngx.sleep(1)
-
-          if exiting() then
-            return
-          end
-
-          sleep_left = sleep_left - 1
+      if isempty(self.clients) then
+        ngx_log(ngx_DEBUG, _log_prefix, "skipping config push (no connected clients)")
+        sleep(1)
+        -- re-queue the task. wait until we have clients connected
+        if push_config_semaphore:count() <= 0 then
+          push_config_semaphore:post()
         end
 
       else
-        ngx_log(ngx_ERR, _log_prefix, "export and pushing config failed: ", err)
+        ok, err = pcall(self.push_config, self)
+        if ok then
+          local sleep_left = delay
+          while sleep_left > 0 do
+            if sleep_left <= 1 then
+              ngx.sleep(sleep_left)
+              break
+            end
+
+            ngx.sleep(1)
+
+            if exiting() then
+              return
+            end
+
+            sleep_left = sleep_left - 1
+          end
+
+        else
+          ngx_log(ngx_ERR, _log_prefix, "export and pushing config failed: ", err)
+        end
       end
 
     elseif err ~= "timeout" then
@@ -571,9 +503,7 @@ end
 
 function _M:init_worker(plugins_list)
   -- ROLE = "control_plane"
-
   self.plugins_list = plugins_list
-
   self.plugins_map = plugins_list_to_map(plugins_list)
 
   self.deflated_reconfigure_payload = nil
@@ -588,61 +518,18 @@ function _M:init_worker(plugins_list)
 
   local push_config_semaphore = semaphore.new()
 
-  -- Sends "clustering", "push_config" to all workers in the same node, including self
-  local function post_push_config_event()
-    local res, err = kong.worker_events.post("clustering", "push_config")
-    if not res then
-      ngx_log(ngx_ERR, _log_prefix, "unable to broadcast event: ", err)
-    end
-  end
-
-  -- Handles "clustering:push_config" cluster event
-  local function handle_clustering_push_config_event(data)
-    ngx_log(ngx_DEBUG, _log_prefix, "received clustering:push_config event for ", data)
-    post_push_config_event()
-  end
-
-
-  -- Handles "dao:crud" worker event and broadcasts "clustering:push_config" cluster event
-  local function handle_dao_crud_event(data)
-    if type(data) ~= "table" or data.schema == nil or data.schema.db_export == false then
-      return
-    end
-
-    kong.cluster_events:broadcast("clustering:push_config", data.schema.name .. ":" .. data.operation)
-
-    -- we have to re-broadcast event using `post` because the dao
-    -- events were sent using `post_local` which means not all workers
-    -- can receive it
-    post_push_config_event()
-  end
-
-  -- The "clustering:push_config" cluster event gets inserted in the cluster when there's
-  -- a crud change (like an insertion or deletion). Only one worker per kong node receives
-  -- this callback. This makes such node post push_config events to all the cp workers on
-  -- its node
-  kong.cluster_events:subscribe("clustering:push_config", handle_clustering_push_config_event)
-
-  -- The "dao:crud" event is triggered using post_local, which eventually generates an
-  -- ""clustering:push_config" cluster event. It is assumed that the workers in the
-  -- same node where the dao:crud event originated will "know" about the update mostly via
-  -- changes in the cache shared dict. Since data planes don't use the cache, nodes in the same
-  -- kong node where the event originated will need to be notified so they push config to
-  -- their data planes
-  kong.worker_events.register(handle_dao_crud_event, "dao:crud")
-
   -- When "clustering", "push_config" worker event is received by a worker,
   -- it loads and pushes the config to its the connected data planes
-  kong.worker_events.register(function(_)
+  events.clustering_push_config(function(_)
     if push_config_semaphore:count() <= 0 then
       -- the following line always executes immediately after the `if` check
       -- because `:count` will never yield, end result is that the semaphore
       -- count is guaranteed to not exceed 1
       push_config_semaphore:post()
     end
-  end, "clustering", "push_config")
+  end)
 
-  ngx.timer.at(0, push_config_loop, self, push_config_semaphore,
+  timer_at(0, push_config_loop, self, push_config_semaphore,
                self.conf.db_update_frequency)
 end
 

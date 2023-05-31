@@ -17,6 +17,7 @@ return {
       "kong/api/routes/config.lua",
       "kong/api/routes/tags.lua",
       "kong/api/routes/clustering.lua",
+      "kong/api/routes/debug.lua",
     },
     nodoc_files = {
       "kong/api/routes/cache.lua", -- FIXME should we document this?
@@ -32,6 +33,8 @@ return {
       "upstreams",
       "targets",
       "vaults",
+      "keys",
+      "key_sets",
     },
     nodoc_entities = {
     },
@@ -133,8 +136,9 @@ return {
 
         ``` json
         {
-            { "services": [],
-              "routes": []
+            {
+                "services": [],
+                "routes": []
             }
         }
         ```
@@ -265,7 +269,7 @@ return {
                         ...
                     ]
                 },
-                "configuration" : {
+                "configuration": {
                     ...
                 },
                 "tagline": "Welcome to Kong",
@@ -439,7 +443,7 @@ return {
                         "type": "boolean"
                     },
                     "key_names": {
-                        "default": "function",
+                        "default": ["apikey"],
                         "required": true,
                         "type": "array"
                     }
@@ -465,7 +469,7 @@ return {
             key relationships or uniqueness check failures against the
             contents of the data store.
           ]],
-          response =[[
+          response = [[
             ```
             HTTP 200 OK
             ```
@@ -475,6 +479,82 @@ return {
                 "message": "schema validation successful"
             }
             ```
+          ]],
+        },
+      },
+      ["/timers"] = {
+        GET = {
+          title = [[Retrieve runtime debugging info of Kong's timers]],
+          endpoint = [[<div class="endpoint post">/timers</div>]],
+          description = [[
+            Retrieve runtime stats data from [lua-resty-timer-ng](https://github.com/Kong/lua-resty-timer-ng).
+          ]],
+          response = [[
+            ```
+            HTTP 200 OK
+            ```
+
+            ```json
+            {   "worker": {
+                  "id": 0,
+                  "count": 4,
+                },
+                "stats": {
+                  "flamegraph": {
+                    "running": "@./kong/init.lua:706:init_worker();@./kong/runloop/handler.lua:1086:before() 0\n",
+                    "elapsed_time": "@./kong/init.lua:706:init_worker();@./kong/runloop/handler.lua:1086:before() 17\n",
+                    "pending": "@./kong/init.lua:706:init_worker();@./kong/runloop/handler.lua:1086:before() 0\n"
+                  },
+                  "sys": {
+                      "running": 0,
+                      "runs": 7,
+                      "pending": 0,
+                      "waiting": 7,
+                      "total": 7
+                  },
+                  "timers": {
+                      "healthcheck-localhost:8080": {
+                          "name": "healthcheck-localhost:8080",
+                          "meta": {
+                              "name": "@/build/luarocks/share/lua/5.1/resty/counter.lua:71:new()",
+                              "callstack": "@./kong/plugins/prometheus/prometheus.lua:673:init_worker();@/build/luarocks/share/lua/5.1/resty/counter.lua:71:new()"
+                          },
+                          "stats": {
+                              "finish": 2,
+                              "runs": 2,
+                              "elapsed_time": {
+                                  "min": 0,
+                                  "max": 0,
+                                  "avg": 0,
+                                  "variance": 0
+                              },
+                              "last_err_msg": ""
+                          }
+                      }
+                  }
+                }
+            }
+            ```
+            * `worker`:
+              * `id`: The ordinal number of the current Nginx worker processes (starting from number 0).
+              * `count`: The total number of the Nginx worker processes.
+            * `stats.flamegraph`: String-encoded timer-related flamegraph data.
+              You can use [brendangregg/FlameGraph](https://github.com/brendangregg/FlameGraph) to generate flamegraph svgs.
+            * `stats.sys`: List the number of different type of timers.
+              * `running`: number of running timers.
+              * `pending`: number of pending timers.
+              * `waiting`: number of unexpired timers.
+              * `total`: running + pending + waiting.
+            * `timers.meta`: Program callstack of created timers.
+              * `name`: An automatically generated string that stores the location where the creation timer was created.
+              * `callstack`: Lua call stack string showing where this timer was created.
+            * `timers.stats.elapsed_time`: An object that stores the maximum, minimum, average and variance
+              of the time spent on each run of the timer (second).
+            * `timers.stats.runs`: Total number of runs.
+            * `timers.stats.finish`: Total number of successful runs.
+
+            Note: `flamegraph`, `timers.meta` and `timers.stats.elapsed_time` keys are only available when Kong's `log_level` config is set to `debug`.
+            Read the [doc of lua-resty-timer-ng](https://github.com/Kong/lua-resty-timer-ng#stats) for more details.
           ]],
         },
       },
@@ -589,6 +669,33 @@ return {
               means Kong does not currently have a valid configuration loaded.
           ]],
         },
+      },
+      ["/status/ready"] = {
+        GET = {
+          title = [[Check node readiness]],
+          endpoint = [[<div class="endpoint get">/status/ready</div>]],
+          description = [[
+            A simple way to inspect the readiness of the configuration.
+
+            An instance is considered *ready* if it has received a valid configuration and
+            is ready to handle incoming requests.
+
+            If a Kong instance is running in DB-less mode or as Hybrid mode Data Plane,
+            it returns `200 OK` if each worker is ready with the valid router and
+            plugins iterator, and the database is reachable.
+
+          ]],
+          response = [[
+            ```
+            HTTP 200 OK
+            ```
+            * Means Kong is ready to serve traffic.
+            ```
+            HTTP 503 Service Unavailable
+            ```
+            * Means Kong is not ready to serve traffic.
+          ]],
+        },
       }
     },
     config = {
@@ -596,6 +703,186 @@ return {
     },
     clustering = {
       skip = true,
+    },
+    debug = {
+      title = [[Debug routes]],
+      description = "",
+      ["/debug/node/log-level"] = {
+        GET = {
+          title = [[Retrieve node log level of a node]],
+          endpoint = [[<div class="endpoint get">/debug/node/log-level</div>]],
+          description = [[
+            Retrieve the current log level of a node.
+
+            See http://nginx.org/en/docs/ngx_core_module.html#error_log for
+            the list of possible return values.
+          ]],
+          response = [[
+            ```
+            HTTP 200 OK
+            ```
+
+            ```json
+            {
+                "message": "log level: debug"
+            }
+            ```
+          ]],
+        },
+      },
+      ["/debug/node/log-level/:log_level"] = {
+        PUT = {
+          title = [[Set log level of a single node]],
+          endpoint = [[<div class="endpoint put indent">/debug/node/log-level/{log_level}</div>]],
+          description = [[
+            Change the log level of a node.
+
+            #### Request Querystring Parameters
+
+            Attributes | Description
+            ---:| ---
+            `timeout`<br>*optional* | The timeout for dynamic log_level, after that, the log level will be reset to the
+            default `log_level` setting from Nginx configuration immediately. If it is set to `0`, the dynamic log_level
+            will expire immediately. Defaults to `60`.
+
+            See http://nginx.org/en/docs/ngx_core_module.html#error_log for a
+            list of accepted values.
+
+            Care must be taken when changing the log level of a node to `debug`
+            in a production environment because the disk could fill up
+            quickly. As soon as the debug logging finishes, revert
+            back to a higher level such as `notice`.
+
+            It's currently not possible to change the log level of DP and
+            DB-less nodes.
+
+            If using Kong Gateway Enterprise, this endpoint can be [RBAC-protected](https://docs.konghq.com/gateway/latest/admin-api/rbac/reference/#add-a-role-endpoint-permission)
+
+            If using Kong Gateway Enterprise, changes to the log level will be reflected in the [Audit Logs](https://docs.konghq.com/gateway/latest/kong-enterprise/audit-log/).
+
+            The log level change is propagated to all Nginx workers of a node,
+            including to newly spawned workers.
+          ]],
+          response = [[
+            ```
+            HTTP 200 OK
+            ```
+
+            ```json
+            {
+                "message": "log level changed"
+            }
+            ```
+          ]],
+        },
+      },
+      ["/debug/cluster/log-level/:log_level"] = {
+        PUT = {
+          title = [[Set node log level of all nodes]],
+          endpoint = [[<div class="endpoint put indent">/debug/cluster/log-level/{log_level}</div>]],
+          description = [[
+            Change the log level of all nodes in a cluster.
+
+            #### Request Querystring Parameters
+
+            Attributes | Description
+            ---:| ---
+            `timeout`<br>*optional* | The timeout for dynamic log_level, after that, the log level will be reset to the
+            default `log_level` setting from Nginx configuration immediately. If it is set to `0`, the dynamic log_level
+            will expire immediately. Defaults to `60`.
+
+            See http://nginx.org/en/docs/ngx_core_module.html#error_log for a
+            list of accepted values.
+
+            Care must be taken when changing the log level of a node to `debug`
+            in a production environment because the disk could fill up
+            quickly. As soon as the debug logging finishes, ensure to revert
+            back to a higher level such as `notice`.
+
+            It's currently not possible to change the log level of DP and
+            DB-less nodes.
+
+            If using Kong Gateway Enterprise, this endpoint can be [RBAC-protected](https://docs.konghq.com/gateway/latest/admin-api/rbac/reference/#add-a-role-endpoint-permission)
+
+            If using Kong Gateway Enterprise, changes to the log level will be reflected in the [Audit Logs](https://docs.konghq.com/gateway/latest/kong-enterprise/audit-log/).
+
+            The log level change is propagated to all Nginx workers of a node,
+            including to newly spawned workers.
+
+            Currently, when a user dynamically changes the log level for the
+            entire cluster, if a new node joins a cluster the new node will
+            run at the previous log level, not at the log level that was
+            previously set dynamically for the entire cluster. To work around that, make
+            sure the new node starts with the proper level by setting the
+            startup `kong.conf` setting [KONG_LOG_LEVEL](https://docs.konghq.com/gateway/latest/reference/configuration/#log_level).
+          ]],
+          response = [[
+            ```
+            HTTP 200 OK
+            ```
+
+            ```json
+            {
+                "message": "log level changed"
+            }
+            ```
+          ]],
+        },
+      },
+      ["/debug/cluster/control-planes-nodes/log-level/:log_level"] = {
+        PUT = {
+          title = [[Set node log level of all Control Plane nodes]],
+          endpoint = [[<div class="endpoint put indent">/debug/cluster/control-planes-nodes/log-level/{log_level}</div>]],
+          description = [[
+            Change the log level of all Control Plane nodes deployed in Hybrid
+            (CP/DP) cluster.
+
+            #### Request Querystring Parameters
+
+            Attributes | Description
+            ---:| ---
+            `timeout`<br>*optional* | The timeout for dynamic log_level, after that, the log level will be reset to the
+            default `log_level` setting from Nginx configuration immediately. If it is set to `0`, the dynamic log_level
+            will expire immediately. Defaults to `60`.
+
+            See http://nginx.org/en/docs/ngx_core_module.html#error_log for a
+            list of accepted values.
+
+            Care must be taken when changing the log level of a node to `debug`
+            in a production environment because the disk could fill up
+            quickly. As soon as the debug logging finishes, revert
+            back to a higher level such as `notice`.
+
+            It's currently not possible to change the log level of DP and
+            DB-less nodes.
+
+            If using Kong Gateway Enterprise, this endpoint can be [RBAC-protected](https://docs.konghq.com/gateway/latest/admin-api/rbac/reference/#add-a-role-endpoint-permission)
+
+            If using Kong Gateway Enterprise, changes to the log level will be reflected in the [Audit Logs](https://docs.konghq.com/gateway/latest/kong-enterprise/audit-log/).
+
+            The log level change is propagated to all Nginx workers of a node,
+            including to newly spawned workers.
+
+            Currently, when a user dynamically changes the log level for the
+            entire cluster, if a new node joins the cluster, the new node will
+            run at the previous log level, not at the log level that was
+           previously set dynamically for the entire cluster. To work around that, make
+            sure the new node starts with the proper level by setting the
+            startup `kong.conf` setting [KONG_LOG_LEVEL](https://docs.konghq.com/gateway/latest/reference/configuration/#log_level).
+          ]],
+          response = [[
+            ```
+            HTTP 200 OK
+            ```
+
+            ```json
+            {
+                "message": "log level changed"
+            }
+            ```
+          ]],
+        },
+      }
     },
     tags = {
       title = [[ Tags ]],
@@ -893,9 +1180,29 @@ return {
 
         A route can't have both `tls` and `tls_passthrough` protocols at same time.
 
+        The 3.0.x release introduces a new router implementation: `atc-router`.
+        The router adds:
+
+        * Reduced router rebuild time when changing Kong’s configuration
+        * Increased runtime performance when routing requests
+        * Reduced P99 latency from 1.5s to 0.1s with 10,000 routes
+
+        Learn more about the router:
+
+        [Configure routes using expressions](/gateway/3.0.x/key-concepts/routes/expressions)
+        [Router Expressions language reference](/gateway/3.0.x/reference/router-expressions-language/)
+
+
         #### Path handling algorithms
 
-        `"v0"` is the behavior used in Kong 0.x and 2.x. It treats `service.path`, `route.path` and request path as
+        {:.note}
+        > **Note**: Path handling algorithms v1 was deprecated in Kong 3.0. From Kong 3.0, when `router_flavor`
+        > is set to `expressions`, `route.path_handling` will be unconfigurable and the path handling behavior
+        > will be `"v0"`; when `router_flavor` is set to `traditional_compatible`, the path handling behavior
+        > will be `"v0"` regardless of the value of `route.path_handling`. Only `router_flavor` = `traditional`
+        > will support path_handling `"v1'` behavior.
+
+        `"v0"` is the behavior used in Kong 0.x, 2.x and 3.x. It treats `service.path`, `route.path` and request path as
         *segments* of a URL. It will always join them via slashes. Given a service path `/s`, route path `/r`
         and request path `/re`, the concatenated path will be `/s/re`. If the resulting path is a single slash,
         no further transformation is done to it. If it's longer, then the trailing slash is removed.
@@ -951,7 +1258,7 @@ return {
           description = [[
             An array of the protocols this Route should allow. See the [Route Object](#route-object) section for a list of accepted protocols.
 
-            When set to only `"https"`, HTTP requests are answered with an upgrade error. When set to only `"http"`, HTTPS requests are answered with an error.
+            When set to only `"https"`, HTTP requests are answered with an upgrade error. When it is set to only `"http"`, this is essentially the same as `["http", "https"]` in that both HTTP and HTTPS requests are allowed. Default: `["http", "https"]`.
           ]],
           examples = {
             {"http", "https"},
@@ -1021,6 +1328,14 @@ return {
           examples = { nil, {{ip = "10.1.0.0/16", port = 1234}, {ip = "10.2.2.2"}, {port = 9123}} },
           skip_in_example = true, -- hack so we get HTTP fields in the first example and Stream fields in the second
         },
+        expression = {
+          kind = "semi-optional",
+          description = [[
+            Use Router Expression to perform route match. This option is only available when `router_flavor` is set
+            to `expressions`.
+          ]],
+          example = "http.path ^= \"/hello\" && net.protocol == \"http\"",
+        },
         strip_path = {
           description = [[
             When matching a Route via one of the `paths`,
@@ -1068,6 +1383,8 @@ return {
             is `HTTP` instead of `HTTPS`.
             `Location` header is injected by Kong if the field is set
             to 301, 302, 307 or 308.
+            Note: This config applies only if the Route is configured to
+            only accept the `https` protocol.
           ]]
         },
         tags = {
@@ -1180,11 +1497,6 @@ return {
         would have otherwise matched config B.
       ]],
 
-      -- deprecated
-      ["/plugins/schema/:name"] = {
-        skip = true,
-      },
-
       ["/plugins/enabled"] = {
         GET = {
           title = [[Retrieve Enabled Plugins]],
@@ -1276,6 +1588,12 @@ return {
           ]],
           example = "rate-limiting",
         },
+        instance_name = {
+          description = [[
+            The Plugin instance name.
+          ]],
+          example = "rate-limiting-foo",
+        },
         config = {
           description = [[
             The configuration properties for the Plugin which can be found on
@@ -1339,12 +1657,25 @@ return {
       fields = {
         id = { skip = true },
         created_at = { skip = true },
+        updated_at = { skip = true },
         cert = {
-          description = [[PEM-encoded public certificate chain of the SSL key pair.]],
+          description = [[
+            PEM-encoded public certificate chain of the SSL key pair.
+
+            This field is _referenceable_, which means it can be securely stored as a
+            [secret](/gateway/latest/plan-and-deploy/security/secrets-management/getting-started)
+            in a vault. References must follow a [specific format](/gateway/latest/plan-and-deploy/security/secrets-management/reference-format).
+          ]],
           example = "-----BEGIN CERTIFICATE-----...",
         },
         key = {
-          description = [[PEM-encoded private key of the SSL key pair.]],
+          description = [[
+            PEM-encoded private key of the SSL key pair.
+
+            This field is _referenceable_, which means it can be securely stored as a
+            [secret](/gateway/latest/plan-and-deploy/security/secrets-management/getting-started)
+            in a vault. References must follow a [specific format](/gateway/latest/plan-and-deploy/security/secrets-management/reference-format).
+          ]],
           example = "-----BEGIN RSA PRIVATE KEY-----..."
         },
         cert_alt = {
@@ -1353,6 +1684,10 @@ return {
             This should only be set if you have both RSA and ECDSA types of
             certificate available and would like Kong to prefer serving using
             ECDSA certs when client advertises support for it.
+
+            This field is _referenceable_, which means it can be securely stored as a
+            [secret](/gateway/latest/plan-and-deploy/security/secrets-management/getting-started)
+            in a vault. References must follow a [specific format](/gateway/latest/plan-and-deploy/security/secrets-management/reference-format).
           ]],
           example = "-----BEGIN CERTIFICATE-----...",
         },
@@ -1361,6 +1696,10 @@ return {
             This should only be set if you have both RSA and ECDSA types of
             certificate available and would like Kong to prefer serving using
             ECDSA certs when client advertises support for it.
+
+            This field is _referenceable_, which means it can be securely stored as a
+            [secret](/gateway/latest/plan-and-deploy/security/secrets-management/getting-started)
+            in a vault. References must follow a [specific format](/gateway/latest/plan-and-deploy/security/secrets-management/reference-format).
           ]],
           example = "-----BEGIN EC PRIVATE KEY-----..."
         },
@@ -1399,6 +1738,7 @@ return {
       fields = {
         id = { skip = true },
         created_at = { skip = true },
+        updated_at = { skip = true },
         cert = {
           description = [[PEM-encoded public certificate of the CA.]],
           example = "-----BEGIN CERTIFICATE-----...",
@@ -1434,6 +1774,7 @@ return {
       fields = {
         id = { skip = true },
         created_at = { skip = true },
+        updated_at = { skip = true },
         name = { description = [[The SNI name to associate with the given certificate.]] },
         certificate = {
           description = [[
@@ -1567,6 +1908,7 @@ return {
       fields = {
         id = { skip = true },
         created_at = { skip = true },
+        updated_at = { skip = true },
         ["name"] = { description = [[This is a hostname, which must be equal to the `host` of a Service.]] },
         ["slots"] = { description = [[The number of slots in the load balancer algorithm. If `algorithm` is set to `round-robin`, this setting determines the maximum number of slots. If `algorithm` is set to `consistent-hashing`, this setting determines the actual number of slots in the algorithm. Accepts an integer in the range `10`-`65536`.]] },
         ["algorithm"] = { description = [[Which load balancing algorithm to use.]] },
@@ -1582,6 +1924,7 @@ return {
         ["hash_fallback_uri_capture"] = { kind = "semi-optional", skip_in_example = true, description = [[The name of the route URI capture to take the value from as hash input. Only required when `hash_fallback` is set to `uri_capture`.]] },
         ["host_header"] = { description = [[The hostname to be used as `Host` header when proxying requests through Kong.]], example = "example.com", },
         ["client_certificate"] = { description = [[If set, the certificate to be used as client certificate while TLS handshaking to the upstream server.]] },
+        ["use_srv_name"] = { description = [[If set, the balancer will use SRV hostname(if DNS Answer has SRV record) as the proxy upstream `Host`.]] },
         ["healthchecks.active.timeout"] = { description = [[Socket timeout for active health checks (in seconds).]] },
         ["healthchecks.active.concurrency"] = { description = [[Number of targets to check concurrently in active health checks.]] },
         ["healthchecks.active.type"] = { description = [[Whether to perform active health checks using HTTP or HTTPS, or just attempt a TCP connection.]] },
@@ -1733,7 +2076,7 @@ return {
         }
       },
       ["/upstreams/:upstreams/targets/:targets/healthy"] = {
-        POST = {
+        PUT = {
           title = [[Set target as healthy]],
           description = [[
             Set the current health status of a target in the load balancer to "healthy"
@@ -1748,9 +2091,11 @@ return {
             This resets the health counters of the health checkers running in all workers
             of the Kong node, and broadcasts a cluster-wide message so that the "healthy"
             status is propagated to the whole Kong cluster.
+
+            Note: This API is not available when Kong is running in Hybrid mode.
           ]],
           endpoint = [[
-            <div class="endpoint post indent">/upstreams/{upstream name or id}/targets/{target or id}/healthy</div>
+            <div class="endpoint put indent">/upstreams/{upstream name or id}/targets/{target or id}/healthy</div>
 
             {:.indent}
             Attributes | Description
@@ -1766,7 +2111,7 @@ return {
         }
       },
       ["/upstreams/:upstreams/targets/:targets/unhealthy"] = {
-        POST = {
+        PUT = {
           title = [[Set target as unhealthy]],
           description = [[
             Set the current health status of a target in the load balancer to "unhealthy"
@@ -1786,9 +2131,11 @@ return {
             that the target is actually healthy, it will automatically re-enable it again.
             To permanently remove a target from the balancer, you should [delete a
             target](#delete-target) instead.
+
+            Note: This API is not available when Kong is running in Hybrid mode.
           ]],
           endpoint = [[
-            <div class="endpoint post indent">/upstreams/{upstream name or id}/targets/{target or id}/unhealthy</div>
+            <div class="endpoint put indent">/upstreams/{upstream name or id}/targets/{target or id}/unhealthy</div>
 
             {:.indent}
             Attributes | Description
@@ -1804,7 +2151,7 @@ return {
         }
       },
       ["/upstreams/:upstreams/targets/:targets/:address/healthy"] = {
-        POST = {
+        PUT = {
           title = [[Set target address as healthy]],
           description = [[
             Set the current health status of an individual address resolved by a target
@@ -1818,9 +2165,11 @@ return {
             This resets the health counters of the health checkers running in all workers
             of the Kong node, and broadcasts a cluster-wide message so that the "healthy"
             status is propagated to the whole Kong cluster.
+
+            Note: This API is not available when Kong is running in Hybrid mode.
           ]],
           endpoint = [[
-            <div class="endpoint post indent">/upstreams/{upstream name or id}/targets/{target or id}/{address}/healthy</div>
+            <div class="endpoint put indent">/upstreams/{upstream name or id}/targets/{target or id}/{address}/healthy</div>
 
             {:.indent}
             Attributes | Description
@@ -1837,7 +2186,7 @@ return {
         }
       },
       ["/upstreams/:upstreams/targets/:targets/:address/unhealthy"] = {
-        POST = {
+        PUT = {
           title = [[Set target address as unhealthy]],
           description = [[
             Set the current health status of an individual address resolved by a target
@@ -1856,9 +2205,11 @@ return {
             that the address is actually healthy, it will automatically re-enable it again.
             To permanently remove a target from the balancer, you should [delete a
             target](#delete-target) instead.
+
+            Note: This API is not available when Kong is running in Hybrid mode.
           ]],
           endpoint = [[
-            <div class="endpoint post indent">/upstreams/{upstream name or id}/targets/{target or id}/unhealthy</div>
+            <div class="endpoint put indent">/upstreams/{upstream name or id}/targets/{target or id}/unhealthy</div>
 
             {:.indent}
             Attributes | Description
@@ -1876,6 +2227,7 @@ return {
       fields = {
         id = { skip = true },
         created_at = { skip = true },
+        updated_at = { skip = true },
         upstream = { skip = true },
         target = {
           description = [[
@@ -1958,6 +2310,163 @@ return {
           examples = {
             { "database-credentials", "data-plane" },
             { "certificates", "critical" },
+          },
+        },
+      },
+    },
+    key_sets = {
+      title = "Key Sets Entity",
+      entity_title = "Key Set",
+      entity_title_plural = "Key Sets",
+      description = [[
+        A Key Set object holds a collection of asymmetric key objects.
+        This entity allows to logically group keys by their purpose.
+      ]],
+      fields = {
+        id = { skip = true },
+        created_at = { skip = true },
+        updated_at = { skip = true },
+        name = { description = [[The name to associate with the given key-set.]] },
+        tags = {
+          description = [[
+            An optional set of strings associated with the Key for grouping and filtering.
+          ]],
+          examples = {
+            { "google-keys", "mozilla-keys" },
+            { "production", "staging", "development" }
+          },
+        },
+      },
+      ["/key-sets/:key_sets"] = {
+        -- needs this to be present because there is a nested endpoint like `key-sets/:id/keys`
+        ["GET"] = {
+          title = "List Keys associated to a specific Key-Set",
+          endpoint = "",
+          description = "Lists all keys within the specifified key set.",
+          response = [[
+            ```
+            HTTP 200 OK
+            ```
+
+            ``` json
+           {
+              "data": [
+                {
+                  "id": "46CA83EE-671C-11ED-BFAB-2FE47512C77A",
+                  "name": "my-key_set",
+                  "tags": ["google-keys", "mozilla-keys"],
+                  "created_at": 1422386534,
+                  "updated_at": 1422386534
+              }, {
+                  "id": "57532ECE-6720-11ED-9297-279D4320B841",
+                  "name": "my-key_set",
+                  "tags": ["production", "staging", "development"],
+                  "created_at": 1422386534,
+                  "updated_at": 1422386534
+              }]
+            }
+            ```
+          ]],
+        },
+        ["PUT"] = {
+          title = "Create a key within a key-set",
+          endpoint = "",
+          description = "Creates a key",
+          response = [[
+            ```
+            HTTP 201 Created
+            ```
+          ]],
+        },
+        ["PATCH"] = {
+          title = "Updates a key within a key-set",
+          endpoint = "",
+          description = "Updates a key within a key-set",
+          response = [[
+            ```
+            HTTP 201 Created
+            ```
+          ]]
+        },
+        ["DELETE"] = {
+          title = "Delete key within key-set",
+          endpoint = "",
+          description = "Delete a key that is associated with this key-set",
+          response = [[
+            ```
+            HTTP 204 No Content
+            ```
+          ]]
+        },
+      }
+    },
+    keys = {
+      title = "Keys Entity",
+      entity_title = "Key",
+      entity_title_plural = "Keys",
+      description = [[
+        A Key object holds a representation of asymmetric keys in various formats.
+        When Kong or a Kong plugin requires a specific public or private key to perform
+        certain operations, it can use this entity.
+      ]],
+      fields = {
+        id = { skip = true },
+        created_at = { skip = true },
+        updated_at = { skip = true },
+        name = { description = [[The name to associate with the given keys.]] },
+        set = {
+          description = [[
+            The id (an UUID) of the key-set with which to associate the key.
+          ]]
+        },
+        kid = {
+          description = [[
+            A unique identifier for a key.
+          ]],
+          example = "42"
+        },
+        jwk = {
+          description = [[
+            A JSON Web Key represented as a string.
+
+            This field is _referenceable_, which means it can be securely stored as a
+            [secret](/gateway/latest/plan-and-deploy/security/secrets-management/getting-started)
+            in a vault. References must follow a [specific format](/gateway/latest/plan-and-deploy/security/secrets-management/reference-format).
+          ]],
+          example = '{"alg":"RSA", "kid": "42", ...}'
+        },
+        pem = {
+          description = [[
+            A keypair in PEM format.
+          ]],
+        },
+        ["pem.private_key"] = {
+          description = [[
+            The private key in PEM format.
+
+            This field is _referenceable_, which means it can be securely stored as a
+            [secret](/gateway/latest/plan-and-deploy/security/secrets-management/getting-started)
+            in a vault. References must follow a [specific format](/gateway/latest/plan-and-deploy/security/secrets-management/reference-format).
+          ]],
+          example = "-----BEGIN"
+        },
+        ["pem.public_key"] = {
+          description = [[
+            The public key in PEM format.
+
+            This field is _referenceable_, which means it can be securely stored as a
+            [secret](/gateway/latest/plan-and-deploy/security/secrets-management/getting-started)
+            in a vault. References must follow a [specific format](/gateway/latest/plan-and-deploy/security/secrets-management/reference-format).
+          ]],
+          example = "-----BEGIN"
+        },
+        tags = {
+          description = [[
+            An optional set of strings associated with the Key for grouping and filtering.
+          ]],
+          examples = {
+            { "application-a", "public-key-xyz" },
+            { "RSA", "ECDSA" }
           },
         },
       },
@@ -2233,7 +2742,7 @@ return {
       ]],
       response = [[
         ```
-        HTTP 201 Created or HTTP 200 OK
+        HTTP 200 OK
         ```
 
         See POST and PATCH responses.
@@ -2262,11 +2771,11 @@ return {
     ["DELETE"] = false,
     -- exceptions for the healthcheck endpoints:
     ["/upstreams/:upstreams/targets/:targets/healthy"] = {
-      ["POST"] = true,
+      ["PUT"] = true,
     },
     ["/upstreams/:upstreams/targets/:targets/unhealthy"] = {
-      ["POST"] = true,
-    },
+      ["PUT"] = true,
+    }
   },
 
 --------------------------------------------------------------------------------
